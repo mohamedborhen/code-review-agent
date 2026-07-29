@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+data/
+.venv/
+logs/
+scripts/test_crg_mcp.py

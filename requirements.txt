@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+sqlmodel
+mcp>=1.27,<2
+filelock
+pydantic-settings

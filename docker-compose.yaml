@@ -1,0 +1,26 @@
+services:
+  code-review-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - workspace_data:/app/data
+    depends_on:
+      - crg-server
+
+  crg-server:
+    image: python:3.12-slim
+    command: >
+      sh -c "pip install code-review-graph && code-review-graph serve --http --port 5555"
+    ports:
+      - "5555:5555"
+    volumes:
+      - workspace_data:/app/data
+    working_dir: /app
+
+volumes:
+  workspace_data:
