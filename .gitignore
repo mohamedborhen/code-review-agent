@@ -6,3 +6,6 @@ data/
 .venv/
 logs/
 scripts/test_crg_mcp.py
+ngrok.exe
+.ngrok.exe.old
+inspect_db.py

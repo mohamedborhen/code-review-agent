@@ -133,12 +133,20 @@ def register_and_build(repo_url: str, repo_id: str) -> None:
 
         with Session(engine) as session:
             if local_path:
-                db_ws = RepoWorkspace(
-                    repo_id=repo_id,
-                    local_path=local_path,
-                    last_synced_commit=commit_hash,
-                )
-                session.add(db_ws)
+                existing = session.exec(
+                    select(RepoWorkspace).where(RepoWorkspace.repo_id == repo_id)
+                ).first()
+                if existing:
+                    existing.local_path = local_path
+                    existing.last_synced_commit = commit_hash
+                    existing.updated_at = datetime.now(timezone.utc)
+                else:
+                    db_ws = RepoWorkspace(
+                        repo_id=repo_id,
+                        local_path=local_path,
+                        last_synced_commit=commit_hash,
+                    )
+                    session.add(db_ws)
 
             snapshot = GraphSnapshot(
                 repo_id=repo_id,

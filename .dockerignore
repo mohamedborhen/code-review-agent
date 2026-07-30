@@ -1,0 +1,14 @@
+.git
+.venv
+data
+logs
+__pycache__
+*.pyc
+.env
+.gitignore
+README.md
+AGENTS.md
+PHASE_*.md
+OPENCODE.md
+check_repo.py
+inspect_db.py

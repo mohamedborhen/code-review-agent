@@ -7,20 +7,30 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - CRG_SERVER_URL=http://crg-server:5555/mcp
     volumes:
       - workspace_data:/app/data
     depends_on:
-      - crg-server
+      crg-server:
+        condition: service_healthy
 
   crg-server:
-    image: python:3.12-slim
-    command: >
-      sh -c "pip install code-review-graph && code-review-graph serve --http --port 5555"
+    build:
+      context: .
+      dockerfile: Dockerfile.crg
+    command: code-review-graph serve --http --port 5555 --host 0.0.0.0
     ports:
-      - "5555:5555"
+      - "5555"
     volumes:
       - workspace_data:/app/data
     working_dir: /app
+    healthcheck:
+      test: python -c "import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost',5555))"
+      interval: 2s
+      timeout: 3s
+      retries: 5
+      start_period: 60s
 
 volumes:
   workspace_data:
