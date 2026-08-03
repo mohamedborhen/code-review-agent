@@ -1,0 +1,35 @@
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AgentInput:
+    repo_id: str
+    graph_commit_hash: str
+    request_type: str
+    diff_content: str | None = None
+    repo_root: str = ""
+
+
+@dataclass
+class AgentFinding:
+    severity: str
+    confidence: float
+    title: str
+    description: str
+    evidence: list[str] = field(default_factory=list)
+    recommendation: str = ""
+
+
+@dataclass
+class AgentOutput:
+    agent_name: str
+    findings: list[AgentFinding] = field(default_factory=list)
+
+
+@dataclass
+class ReviewResult:
+    """Outcome of one review run: the aggregated reply plus one output per
+    routed subagent (the audit trail needs both)."""
+
+    aggregated: AgentOutput
+    per_agent: list[AgentOutput] = field(default_factory=list)

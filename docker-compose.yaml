@@ -9,6 +9,7 @@ services:
       - .env
     environment:
       - CRG_SERVER_URL=http://crg-server:5555/mcp
+      - ATLASSIAN_MCP_URL=http://mcp-atlassian:9000/mcp
     volumes:
       - workspace_data:/app/data
     depends_on:
@@ -31,6 +32,28 @@ services:
       timeout: 3s
       retries: 5
       start_period: 60s
+
+  mcp-atlassian:
+    image: ghcr.io/sooperset/mcp-atlassian:latest
+    env_file:
+      - .env
+    environment:
+      - TRANSPORT=streamable-http
+      - PORT=9000
+      - HOST=0.0.0.0
+      - READ_ONLY_MODE=true
+      - ALLOW_GLOBAL_CRED_FALLBACK=true
+      - TOOLSETS=all
+      - ENABLED_TOOLS=jira_get_issue,confluence_search,confluence_get_page
+    ports:
+      - "9000"
+    healthcheck:
+      test: python -c "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz')"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
 
 volumes:
   workspace_data:

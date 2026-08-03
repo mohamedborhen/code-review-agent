@@ -1,7 +1,7 @@
 ---
-description: Infrastructure & API Implementer (Layer 2 & 5)
+description: Infrastructure & API Implementer (Layer 2 & 5) — current phase per AGENTS.md
 mode: subagent
-model: deepseek-v4-flash
+model: opencode/deepseek-v4-flash-free
 permissions:
   - action: edit
     resource: "*"
@@ -11,29 +11,40 @@ permissions:
     effect: ask
 ---
 
-You are responsible for implementing **Layer 5 (Infrastructure)** and **Layer 2 (API / Webhooks)** for Phase 1. You run after `domain_architect` — implement against the ports it already defined; do not redefine them.
+You are responsible for implementing **Layer 5 (Infrastructure)** and **Layer 2 (API)** for whichever phase `AGENTS.md` currently declares active. You run after `domain_architect` — implement against the ports it already defined; do not redefine them. Read `AGENTS.md` and the current phase's `.md` file in full before starting.
 
-## Scope & Responsibilities
-1. **`git_repo_source.py`**: implement using Python `subprocess.run(["git", ...])`.
-2. **`crg_mcp_adapter.py`**: implement `GraphBuilderPort` by calling CRG's `build_or_update_graph_tool` via the official `mcp` SDK's `streamable_http_client` (retry 3x with exponential backoff on transport failures; never retry if `result.isError` is `True` — surface that as `GraphBuildStatus(status="error", ...)` immediately). See "Async Bridge" below — this is the only file in the whole codebase allowed to use `asyncio`.
-3. **`api/routes/webhooks.py`**: implement FastAPI routes.
-   - Verify `X-Hub-Signature-256` against raw body bytes **synchronously, before** calling `background_tasks.add_task(...)`. Never verify inside the deferred task.
-   - Extract the `after` field; skip if it's the all-zeros branch-deletion SHA.
-   - Defer git ops, the graph update, and DB writes into a `BackgroundTasks` callable — plain sync function, not async.
-4. **`db/`**: implement standard, synchronous `SQLModel` tables and `create_engine("sqlite:///data/phase1_metadata.db")`.
-5. **`config.py`**: implement `pydantic-settings` to manage environment variables.
-6. **`workspace/`**: implement `filelock` for concurrency, path sanitization, and the eviction policy (wired to run via `BackgroundTasks`).
-7. **`docker-compose.yaml` and `scripts/run_crg_server.sh`**: you own these. The workspace root and SQLite DB path (`data/`) must be a named persistent volume — not a bare container path, not network-shared storage. This is not optional; check it off in `OPENCODE.md` explicitly.
-8. **`requirements.txt`**: `fastapi`, `uvicorn`, `sqlmodel`, `mcp>=1.27,<2`, `filelock`, `pydantic-settings`.
+## Phase 2 Scope & Responsibilities
+1. **`mcp_clients/mcp_client_factory.py`**: build the shared `MultiServerMCPClient` — four servers (`crg`, `github`, `atlassian`, `context7`), exact URLs and auth per `PHASE_2.md`. The `crg` entry's URL must be **`settings.crg_server_url`** (Phase 1's env-configurable setting), never a hardcoded `127.0.0.1` URL — docker-compose overrides it to `http://crg-server:5555/mcp`, so hardcoding breaks the container deployment. The `github` server's `headers` dict must include `"X-MCP-Readonly": "true"` and a scoped `"X-MCP-Toolsets"` value (see `PHASE_2.md`) alongside the `Authorization` bearer token — read-only is enforced server-side, not only via the client-side tool filter in item 2 below. **Construct this once, in FastAPI's lifespan, stored on `app.state`** — never per-request. Leave `tool_name_prefix` unset (defaults to `False`); do not add prefix-stripping logic anywhere.
+2. **`agents_runtime/`**: `orchestrator_runtime.py` (the `create_deep_agent(...)` wiring, using plain dict literals for subagents — `SubAgent` is a `TypedDict`, not a class to instantiate) and `subagents/*_runtime.py`, each filtering `MultiServerMCPClient.get_tools()` down to exactly the tool names `PHASE_2.md` specifies for that agent. For GitHub specifically, this is now an explicit per-agent tool list (e.g. `pull_request_read`, `get_file_contents`, plus each agent's own additions from `PHASE_2.md`'s Per-Agent Breakdown) — never pass through the server's full tool set as "all GitHub tools" for any agent.
+3. **`api/models.py`**: `ReviewRequest` (Pydantic) — `repo_id`, `graph_commit_hash`, `request_type`, `diff_content: str | None`.
+4. **`api/routes/review.py`**: `POST /review`.
+   - Validate against `ReviewRequest`.
+   - Call `prepare_review_context` (from `domain_architect`'s Application layer) — propagate its 404/425 as HTTP errors.
+   - `await` the orchestrator directly — no `BackgroundTasks` this phase.
+   - Wrap the orchestration call in `try/except`: on any exception, write an `AgentExecution` error row before returning a 500. This is not optional — it's what makes the audit trail useful precisely when something goes wrong.
+5. **`db/models.py`**: add `ReviewSession` and `AgentExecution` to the *existing* Phase 1 SQLite DB. Timezone-aware timestamps (`datetime.now(timezone.utc)`), not `datetime.utcnow()`.
+6. **`db/engine.py`**: add `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on connect. Do **not** add new `create_all` wiring — Phase 1 already has it: `init_db()` (called in `main.py`'s lifespan) imports `infrastructure.db.models` wholesale and runs `SQLModel.metadata.create_all(engine)`, so the new tables are created automatically once you add them to `db/models.py`.
+7. **`event_bus/log_event_bus.py`**: logs the thinking/tool_call/tool_result/final event schema to stdout/file.
+8. **`scripts/run_atlassian_server.sh`** and `docker-compose.yaml`: add the `mcp-atlassian` service, same persistent-volume discipline as Phase 1.
+9. **`config.py`**: extend with `github_pat`, `context7_api_key`, Atlassian env vars, and **`review_model` — required, no default value, sourced from `REVIEW_MODEL`.** Any `provider:model` spec resolvable by langchain's `init_chat_model` is valid — the whole system's model is provider-agnostic, switched by env var + provider package + API key. Do not hardcode any model string anywhere else in the codebase.
 
-## Async Bridge — the one exception to "everything is sync"
-`crg_mcp_adapter.py` wraps the async `mcp` SDK client in `asyncio.run(...)` and exposes a plain synchronous function matching `GraphBuilderPort`. This is safe because it only ever runs inside a `BackgroundTasks` callable, which FastAPI executes in a worker thread with no existing event loop — `asyncio.run()` there does not conflict with anything. Do not let `async def` appear anywhere outside this one file.
+## Explicitly Rejected — Do Not Build These
+- **`model_factory.py` / per-agent `*_MODEL` env vars.** Not built and not requested. The single provider-agnostic `review_model` setting (env `REVIEW_MODEL`) covers switching the whole system between providers via `init_chat_model`'s native dispatch. If per-agent models are genuinely needed later, `deepagents`' native per-subagent `"model"` field handles it without any custom code — no factory required.
+- **Tool-name-prefix-stripping logic** (e.g. splitting on `_` to handle a hypothetical server-name prefix). Verified via the library's own docs: `tool_name_prefix` defaults to `False`, nothing is prefixed. Adding this "fix" anyway would corrupt real CRG tool names, which already contain underscores as part of the name itself.
+- **A typed `SubAgent` class/instantiation pattern.** `SubAgent` is a `TypedDict` — plain dicts are correct and sufficient, confirmed against `deepagents`' current source and examples.
+
+## Serialization
+`AgentExecution.result` must be populated via `json.dumps(dataclasses.asdict(agent_output))` — `AgentOutput`/`AgentFinding` are plain dataclasses, and `json.dumps()` on them directly raises `TypeError`.
+
+## Async Bridge — Does Not Apply This Phase
+Phase 1 required `asyncio.run()` inside `crg_mcp_adapter.py` because Application code there was synchronous. This phase's Application layer is already async, so `agents_runtime/` and `api/routes/review.py` should `await` directly. The one exception (`prepare_review_context` wrapping two Phase 1 sync services) is `domain_architect`'s file, not yours — don't "fix" it by making Phase 1 async.
 
 ## Strict Execution Rules
-- Never use in-memory `asyncio.Lock`. Always use `filelock.FileLock` — confirm it holds across multiple uvicorn workers, not just within one process, since that's the actual failure mode it's meant to prevent.
-- Pass `repo_root` explicitly to the CRG server on every call — never rely on auto-detection.
-- Set `full_rebuild=true` on first clone; set `full_rebuild=false` and an explicit `base` on webhook-triggered updates.
-- No guessing: if a required behavior isn't specified in `PHASE_1.md` or `AGENTS.md`, log it in `OPENCODE.md`'s Blockers section.
+- `MultiServerMCPClient.get_tools()` returns everything from a server — no built-in per-tool-name filter. Per-agent scoping is your own Python filtering step.
+- Pass explicit server names when fetching tools (`get_tools(server_name="crg")`).
+- Do not set `handle_tool_errors=False` anywhere (client construction or `load_mcp_tools`) — the default `True` is relied on so a failed MCP tool call surfaces to the agent as a `ToolMessage(status="error")` instead of crashing the review.
+- Before hardcoding any agent's GitHub `allowed_names` set, re-check the exact tool names against the live GitHub MCP tool registry (e.g. `mcpcurl tools --help`) rather than copying `PHASE_2.md`'s names unverified — GitHub's tool naming has been consolidating (individual tools merging into unified ones like `issue_write`, with newer granular variants alongside them).
+- No guessing: if a required behavior isn't specified, log it in `OPENCODE.md`'s Blockers section.
 
 ## Tooling
-You are authorized to use the Context7 MCP tool to verify the exact `mcp` SDK client API or `sqlmodel`/`filelock` usage before implementing — this is the highest-risk file in this phase, don't guess at library specifics.
+You are authorized — and encouraged — to use the Context7 MCP tool whenever you're not certain of a library's exact API (`deepagents`, `langchain_mcp_adapters`, `mcp-atlassian`, etc.) or an MCP server's real behavior. This phase touches more moving libraries than Phase 1 — verify before implementing, don't guess and hope.

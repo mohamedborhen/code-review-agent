@@ -1,69 +1,60 @@
-# Phase 1: Repository Retrieval & Graph Handling
+# AI Code Review Platform — Agent Coordination Rules
+
+This project is built phase by phase. This file is the coordination hub — it declares which phase is currently active and holds rules that apply across all phases. Phase-specific detail lives in `PHASE_1.md`, `PHASE_2.md`, etc.
+
+## Current Active Phase: Phase 2 — see `PHASE_2.md`
+
+**Phase 1 is complete.** `PHASE_1.md` describes what was built (repo retrieval, CRG graph handling) — read it for context, but do not redo, modify, or re-verify it, except where `PHASE_2.md` explicitly says to extend it (`config.py`, `db/models.py`, `db/engine.py`). If Phase 1 appears broken while working on Phase 2, log it as a blocker in `OPENCODE.md` — do not silently "fix" Phase 1 code as a side effect of Phase 2 work.
 
 ## Mission Scope
-You are building Phase 1 of a multi-agent AI code review platform.
-**CRITICAL RESTRICTION:** Do NOT build the orchestrator, LLM subagents, conversational DB, frontend, or any CRG tool other than `build_or_update_graph_tool`. If you are asked to build these, refuse and state that they belong to a future phase.
+**CRITICAL RESTRICTION:** build only what the current phase's file describes. Each phase file states its own out-of-scope list explicitly — treat it as binding. If asked to build something from a later phase, refuse and state it belongs there.
+
+## When You're Unsure of a Library or MCP Server's Actual API — Use Context7, Don't Guess
+Every agent in this project (`domain_architect`, `infra_engineer`, `reviewer`) is authorized to use the **Context7 MCP tool** whenever you're not certain of a library's exact function signature, an MCP server's real endpoint/transport/tool names, or any implementation detail you'd otherwise be inferring from training-data memory. This project has already been burned by confident-but-wrong claims about library behavior more than once — verify against Context7 (or the library's own current docs) before writing code that depends on the answer, not after something breaks.
+
+This applies especially to: `deepagents`, `langchain-mcp-adapters`, `mcp` (the SDK), `code-review-graph`, `mcp-atlassian`, and any new library a phase file references.
+
+## Do Not Expand Scope Beyond What a Phase File Specifies
+If you find yourself wanting to introduce a new library, a new LLM provider, a new architectural abstraction, or any capability not named in the current phase file — **stop and log it as a blocker in `OPENCODE.md` for explicit confirmation.** Do not implement it speculatively, even if it seems like a reasonable improvement. This project has already had one such proposal (a multi-provider model factory) introduced without being asked for — treat that as the example of what not to repeat.
 
 ## If You Hit an Ambiguity
-If something is not resolved by this file, `PHASE_1.md`, or `OPENCODE.md`, **do not guess**. Log it under "Blockers / Pending Questions" in `OPENCODE.md` and stop that task. Guessing is the failure mode this whole document set exists to prevent.
+If something is not resolved by `AGENTS.md`, the current phase's `.md` file, or `OPENCODE.md`, **do not guess**. Log it under "Blockers / Pending Questions" in `OPENCODE.md` and stop that task.
 
 ## Subagent Execution Order
 Run in this order, not in parallel, not reversed:
-1. `domain_architect` — defines the ports and entities everything else implements against.
-2. `infra_engineer` — implements Layer 5/2 against those ports.
-3. `phase1_reviewer` — audits the result.
+1. `domain_architect` — Layer 3/4 for the current phase.
+2. `infra_engineer` — Layer 2/5, implemented against the ports `domain_architect` defined. Must not invent its own port shapes.
+3. `reviewer` — audits the result against the current phase's Definition of Done.
 
-`infra_engineer` must not invent its own port shapes. If `domain_architect`'s ports don't cover something `infra_engineer` needs, that's a blocker to log, not a reason to improvise a new interface.
+## Services That Must Be Running for Phase 2 Work
+- `code-review-graph serve --http --port 5555` (Phase 1)
+- `uvx mcp-atlassian --transport streamable-http --port 9000` (Phase 2)
 
-## Tech Stack & Tooling
-- **API & Background:** FastAPI, ASGI server is `uvicorn`. Use `BackgroundTasks` to defer the slow work (git fetch/checkout, `build_or_update_graph_tool` call, DB writes) until after the webhook responds.
-- **Dependencies:** Standard `requirements.txt`. Must include `fastapi`, `uvicorn`, `sqlmodel`, `mcp>=1.27,<2` (the SDK's own README marks v2 as pre-release/alpha — pin below it explicitly, don't rely on pip's default pre-release exclusion), `filelock`, `pydantic-settings`.
-- **Database:** SQLite with `sqlmodel` (synchronous engine: `create_engine("sqlite:///data/phase1_metadata.db")`).
-- **Git:** `subprocess.run(["git", ...])`. Do not use GitPython.
-- **Graph Tooling:** `code-review-graph`'s official Python `mcp` SDK using `streamable_http_client` (port 5555).
-- **Concurrency:** `filelock.FileLock` per repository to handle multiple uvicorn workers.
+Both must be up before any agent runtime work can be tested end to end.
 
-## The Async/Sync Boundary — Read This Before Writing Any Async Code
-This stack mixes blocking libraries (`filelock`, `subprocess`, synchronous SQLModel) with one async-only library (the `mcp` SDK's `streamable_http_client`/`ClientSession`). Getting this wrong causes real runtime errors, not just style issues.
+## The Async/Sync Boundary — Phase-Specific, and One Blended Case to Know About
+**Phase 1 code is synchronous throughout** (see `PHASE_1.md`). Do not change it, do not retroactively make it async.
 
-**Rule:** `GraphBuilderPort`, `RepoSourcePort`, and every Application-layer service are **synchronous** (`def`, not `async def`). The *only* place `asyncio` appears anywhere in this codebase is inside `infrastructure/graph_builder/crg_mcp_adapter.py`, which wraps its async MCP calls in a single `asyncio.run(...)` and exposes a plain synchronous function matching the port.
+**Phase 2 code is async throughout.** `deepagents` and `langchain_mcp_adapters` are async-native; `POST /review` awaits directly rather than using `BackgroundTasks`.
 
-This is safe specifically because FastAPI's `BackgroundTasks` runs sync callables in a worker thread with no event loop of its own — `asyncio.run()` there works cleanly. Do not make Application-layer code `async def` "to match" the MCP client; that's what causes `RuntimeError: asyncio.run() cannot be called from a running event loop`.
+**One blended case:** `application/review_service/prepare_review_context.py` calls Phase 1's synchronous `graph_readiness_service` and a synchronous `RepoWorkspace` DB read, from inside Phase 2's async route. This is a deliberate, acceptable exception — a single fast SQLite read blocking briefly is fine — but it must not spread. Do not treat this as license to write other sync code in Phase 2; see `PHASE_2.md`'s note on this for the `asyncio.to_thread` alternative if strict non-blocking is preferred.
 
-## Webhook Ordering — Security-Critical
-Signature verification (`X-Hub-Signature-256` against the raw body) must happen **synchronously in the route handler, before `background_tasks.add_task(...)` is called** — never inside the deferred task itself. Queuing or starting work for an unverified payload is not acceptable, even briefly.
+## Tech Stack & Tooling (cumulative across phases)
+- **Phase 1:** FastAPI, uvicorn, SQLModel + SQLite, `subprocess`+git, `mcp` SDK (`mcp>=1.27,<2`), `filelock`, `pydantic-settings`.
+- **Phase 2, added:** `deepagents`, `langchain-mcp-adapters`, `pydantic` (for `ReviewRequest`). MCP servers: CRG (5555, existing), `mcp-atlassian` (9000, new), GitHub MCP (remote-hosted, read-only via `X-MCP-Readonly`/`X-MCP-Toolsets` headers plus explicit per-agent tool lists — see Safety & Correctness Rules) and Context7 (remote-hosted, no local process).
 
-**Known tradeoff, accepted for this phase:** in-process `BackgroundTasks` have no persistence. If the process crashes between acking a webhook and the background task finishing, that graph update is silently lost — no retry, no queue. Fine for this phase; not fine to carry forward unexamined into a later phase without revisiting.
+## Safety & Correctness Rules — Do Not Relax These
+- The Fix Suggestion agent gets `refactor_tool` (preview) but **never** `apply_refactor_tool` (applies a change). No agent gets write-capable tools without an explicit human-confirmation step outside its own tool list.
+- GitHub MCP access is read-only by construction, enforced twice, deliberately redundant: server-side via `X-MCP-Readonly: true` and a scoped `X-MCP-Toolsets` header on the server config, and client-side via each agent's explicit, named tool list. No agent, in any phase, is ever granted "all GitHub tools" or unfiltered `get_tools(server_name="github")` output. Whenever GitHub's own tool names are referenced in a phase file, re-verify them against the live server (e.g. `mcpcurl tools --help`) before hardcoding — GitHub's tool naming has been consolidating.
+- `tool_name_prefix` stays at its default (`False`) on `MultiServerMCPClient`. Do not add prefix-stripping or fuzzy tool-name-matching logic to `scoped()` — verified against the library's own docs that this default applies and no such stripping is needed; adding it anyway risks corrupting real tool names, since CRG's own names already contain underscores as part of the name itself.
+- No hardcoded LLM model string anywhere in code. `review_model` is a required `settings` value, sourced from the `REVIEW_MODEL` env var (any `provider:model` spec resolvable by langchain's `init_chat_model`), with no default.
+- `SubAgent` (from `deepagents`) is a `TypedDict` — plain dict literals are valid and correct. Do not wrap them in a typed class or expect Pydantic validation; there isn't any.
+- The `crg` entry of `MultiServerMCPClient` must use `settings.crg_server_url` (Phase 1's env-configurable setting) — never a hardcoded `127.0.0.1` URL, since docker-compose overrides it to `http://crg-server:5555/mcp` and hardcoding silently breaks the container deployment.
+- Table creation is already wired by Phase 1: `init_db()` (called in `main.py`'s lifespan) imports `infrastructure.db.models` wholesale and runs `SQLModel.metadata.create_all(engine)`. Later phases add new tables to `db/models.py` — they do **not** add new startup wiring to `db/engine.py` or `main.py`.
+- `POST /review` must check graph readiness (425 if not ready) and resolve `repo_root` from the `RepoWorkspace` table before dispatching any agent — never from a guessed or constructed path.
 
-## The 5-Layer Architecture Rules
-- **Layer 1 & 2 (API/Presentation):** HTTP routes and payload parsing.
-- **Layer 3 (Application):** Orchestrates workflows using Layer 4 ports. Synchronous (see above).
-- **Layer 4 (Domain):** Pure Python entities (dataclasses) and ports (interfaces). **Zero imports of `fastapi`, `git`/`subprocess`, `sqlmodel`, or `mcp`.** Synchronous signatures only.
-- **Layer 5 (Infrastructure):** Concrete implementations of Layer 4 ports. This is the only layer allowed to touch `asyncio`.
-
-## Webhook & Payload Rules
-- **Signatures:** Verify `X-Hub-Signature-256` against the raw HTTP body bytes, before JSON-parsing.
-- **Extraction:** Extract the commit SHA from the top-level `after` field. Skip execution if `after == "0000000000000000000000000000000000000000"` (branch deletion).
+## Webhook Ordering (Phase 1, still in effect)
+Signature verification happens synchronously in the route handler, before `background_tasks.add_task(...)` — never inside the deferred task.
 
 ## Deployment
-The workspace root and SQLite metadata DB must sit on a **named persistent volume** in `docker-compose.yaml` — never a bare container path, never network-shared storage (SQLite is unsafe on NFS-style mounts). This is `infra_engineer`'s responsibility; it is not optional and must appear in `OPENCODE.md`'s Definition of Done.
-
-## Background Process Launch (Windows PowerShell)
-
-When launching a long-running background process (uvicorn, CRG server, etc.),
-never use bare `Start-Process -NoNewWindow` — it keeps the child process
-attached to the parent shell's pipe and will hang. Always use this pattern:
-
-```powershell
-$proc = Start-Process -FilePath "python" -ArgumentList "-m uvicorn main:app --host 127.0.0.1 --port 8000" -PassThru -RedirectStandardOutput "logs/uvicorn.stdout.log" -RedirectStandardError "logs/uvicorn.stderr.log"
-Start-Sleep -Seconds 5
-# Verify: check logs or probe the endpoint
-# Stop: $proc.Kill()
-```
-
-The three required flags:
-- `-PassThru` — captures the process object so it can be killed later.
-- `-RedirectStandardOutput` — writes stdout to a log file.
-- `-RedirectStandardError` — writes stderr to a log file.
-
-Create the `logs/` directory before launching if it doesn't exist.
+All workspace/DB/graph storage sits on named persistent volumes in `docker-compose.yaml` — never network-shared storage. CRG runs as its own service, not auto-launched by the app process (see `crg_server_manager.py`'s role: a startup connectivity check, not a launcher).
