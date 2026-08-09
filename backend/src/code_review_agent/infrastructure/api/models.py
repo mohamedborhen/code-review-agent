@@ -13,3 +13,4 @@ class ReviewRequest(BaseModel):
     graph_commit_hash: str
     request_type: str  # must match a key in the Routing Policy
     diff_content: str | None = None  # optional — explain_question may not need one
+    question: str | None = None  # optional — free-form question; steers any_question AND the single-specialist question types

@@ -8,8 +8,8 @@ class RepoWorkspace(SQLModel, table=True):
     repo_id: str = Field(unique=True, index=True)
     local_path: str
     last_synced_commit: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class GraphSnapshot(SQLModel, table=True):
@@ -18,7 +18,7 @@ class GraphSnapshot(SQLModel, table=True):
     commit_hash: str
     status: str
     error_message: str | None = None
-    started_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
 
 

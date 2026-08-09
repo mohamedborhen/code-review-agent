@@ -69,7 +69,23 @@ result = await agent.ainvoke({"messages": [{"role": "user", "content": review_re
 
 Each subagent dict's `tools` list must contain LangChain `BaseTool` objects, not raw MCP tool names or dicts — see the loading pattern below for how those are produced.
 
+**Verified implementation notes (what the code actually does):**
+- **One root deep agent, not two.** The Orchestrator and Aggregator are a single `create_deep_agent` root whose `system_prompt` is `orchestrator.md` + `aggregator.md` concatenated: the root's classify phase is the Orchestrator, its synthesis phase the Aggregator. `response_format=SubagentReport` is set on the root and deepagents propagates it to every subagent, so each subagent's `ToolMessage` content is the JSON serialization of a `SubagentReport` (that is what per-agent audit rows are parsed from).
+- **Subagents built by per-agent builder functions** (`subagents/*_runtime.py`, each `build_*_spec(mcp_client, store)` returning a plain dict literal — not a typed class). All five specialists are registered whenever the routed set is non-empty (`fix_suggestion` is available on demand; the orchestrator decides whether to use it); for an empty routed set (`explain_question`) `subagents=None` — no subagents are constructed at all.
+- **Safety harness profile (`harness_profile.py`).** `create_deep_agent` always injects a built-in tool suite (`ls`, `read_file`, `write_file`, `edit_file`, `delete`, `glob`, `grep`, `execute`); the `tools` parameter is strictly additive and cannot remove them. A `HarnessProfile` with `excluded_tools` strips all eight and disables the general-purpose subagent. The profile is registered under EVERY key deepagents may resolve (the raw model spec AND the pre-built path's resolved `provider:identifier`), so no agent — root or subagent — ever holds a write/execute-capable built-in tool. `task` is deliberately retained: the orchestrator needs it to delegate.
+- **Per-subagent capture (`capture.py`).** Each subagent spec gets a `SubagentCaptureMiddleware`, which times the run (real `duration_ms` into a `CaptureStore`) and wraps the model call to emit the subagent's own reasoning and attempted/rejected tool calls as events.
+- **Tolerant report parsing + bounded retry (in `orchestrator_runtime.py`).** The configured free-tier model drifts from the exact report shape run to run (markdown-fenced JSON, `<subagent_report>` XML wrappers, nested `{"security_review": {"findings": [...]}}`, `violations`/`security_findings` aliases, string confidences, `location`/`risk_score`/`recommendations` synonyms). Strict `SubagentReport` validation is attempted first; `_extract_json`/`_findings_list`/`_coerce_finding`/`_coerce_report` recover the rest so per-agent `AgentExecution` rows carry real findings. `_run_with_retry` re-runs the agent once on transient deepagents structured-output parse failures (a weak-model empty-native-output 500 observed once), unrelated exceptions propagate to the 500 boundary immediately.
+
 **`config.py` addition:** `review_model: str` with **no default value** — force it via env var (`REVIEW_MODEL=<provider>:<model>`). It is the single model spec for the whole multi-agent system. deepagents resolves it via langchain's `init_chat_model`, which dispatches by provider prefix (`groq:`, `openrouter:`, `google_genai:`, `openai:`, `anthropic:`, `deepseek:`, `ollama:`, ...), so switching providers is a config + package + API-key change, never a code change. Do not hardcode any specific dated model snapshot in code; that just relocates the staleness problem instead of removing it. The provider's langchain integration package (see `requirements.txt`) and its API key env var (e.g. `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `GOOGLE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_HOST`) must be present — only the one matching `REVIEW_MODEL` is required.
+
+**`config.py` additions beyond `review_model`** (all env-configurable, nothing hardcoded):
+- `review_max_tokens: int = 2000` (`REVIEW_MAX_TOKENS`) — output-token budget forwarded to the provider as `max_tokens`. Left unset, deepagents/openrouter resolve to the model's full output window (16k for gpt-4o-mini), which the OpenRouter free tier rejects. Raised to 8192 for the NVIDIA Nemotron 49B demo model, which burns completion tokens on `reasoning_content` (a 2000 cap truncated a long-reasoning turn into an empty assistant message → empty subagent report).
+- `review_timeout: int = 600` (`REVIEW_TIMEOUT`) — per-model-call timeout forwarded as `timeout`, replacing a hardcoded 240s that surfaced as "Timeout on reading data from socket" on a free-tier long-reasoning turn.
+- `atlassian_mcp_url` (`ATLASSIAN_MCP_URL`) — the mcp-atlassian endpoint; docker-compose overrides to `http://mcp-atlassian:9000/mcp` for the same reason `crg_server_url` is a setting.
+- Jira/Confluence auth (`JIRA_URL`, `JIRA_USERNAME`, `JIRA_API_TOKEN`, `CONFLUENCE_URL`, `CONFLUENCE_USERNAME`, `CONFLUENCE_API_TOKEN`) — read by the mcp-atlassian process, never sent as client headers.
+- `model_config` uses `extra="ignore"`: the shared `.env` also carries keys owned by other processes (LLM provider keys, mcp-atlassian server vars) that are not `Settings` fields; pydantic-settings defaults to `extra="forbid"`, which would crash boot.
+
+Both caps are delivered to deepagents via a `ProviderProfile` registered in `_ensure_review_provider_profile()` under the exact `settings.review_model` key, so the model stays a STRING while `init_chat_model` receives `max_tokens`/`timeout`.
 
 ## MCP Tool Loading — Verified API
 
@@ -140,6 +156,11 @@ def scoped(tools: list, allowed_names: set[str]) -> list:
 
 **Design choice — `handle_tool_errors` (left at its default).** `MultiServerMCPClient`/`load_mcp_tools` default to `handle_tool_errors=True`: an MCP tool execution error comes back as a `ToolMessage` with `status="error"` instead of raising, so the calling agent sees the failure and can retry or adjust rather than the review crashing outright. This is relied on, not accidental — do not set `handle_tool_errors=False` anywhere in this phase.
 
+**Verified tooling additions (files that make the scoping actually work):**
+- **`tool_lists.py`** — the single source of per-agent tool names: `CRG`, `GITHUB[agent]`, `ATLASSIAN_COMPLIANCE`/`ATLASSIAN_FIX_SUGGESTION`, and `AGENT_TOOL_PLAN[agent] = {server: allowed_names}` where a value of `None` means "all tools from that server" (used only for Context7 — read-only documentation lookup by design) and `set()` means "none from that server". One file so the DoD's "verify tool names against the live registry" pass is a single-file edit.
+- **`tool_descriptions.py`** — one-line description overrides for every scoped tool. MCP tools ship verbose multi-paragraph descriptions (CRG's ~500 tokens) that are re-sent on every turn of every carrying agent; the wrapper substitutes the terse versions, cutting the per-request schema payload ~70-80% while keeping enough to pick the right tool.
+- **`tool_scoping.py`** — `scope_agent_tools()` fetches per server and filters via `scoped()`; skips `get_tools()` entirely for servers an agent wants zero tools from (so a down mcp-atlassian can't fail a Security/Performance/Regression build). Each scoped tool is wrapped so its call/result is emitted to the event bus tagged with the owning subagent (subagent-internal MCP calls are invisible to the orchestrator's message walk), tool results fed back to the model are truncated to 4000 chars (they sit in conversation history and are re-sent every turn), and OpenAI-style `anyOf`-null unions are stripped from args schemas (strict tool-call validation rejects them).
+
 **Atlassian connection — confirmed exact launch command** (self-hosted `mcp-atlassian`, chosen over the official Rovo server because it needs a plain API token, no org-admin enablement step):
 
 ```bash
@@ -147,7 +168,7 @@ uvx mcp-atlassian --transport streamable-http --port 9000
 ```
 Auth via env vars (`JIRA_URL`, `JIRA_USERNAME`, `JIRA_API_TOKEN`, plus the Confluence equivalents) passed to that process, not through the MultiServerMCPClient headers.
 
-**Atlassian server-side hardening (both launch paths — `run_atlassian_server.sh` and the compose service):** `READ_ONLY_MODE=true` blocks every write action; `ENABLED_TOOLS=jira_get_issue,confluence_search,confluence_get_page` is an exact-name allowlist that mcp-atlassian enforces at both `tools/list` and call time (its `_is_tool_authorized`, v0.23.0). No review agent can ever reach the ~38 other Jira tools or ~20 other Confluence tools — not even a read like `jira_search`. This is the server-side half of the "no blanket Atlassian tools" guarantee; the client-side half is each agent's exact `allowed_names` set below (deliberately redundant, same as GitHub). `ALLOW_GLOBAL_CRED_FALLBACK=true` is mcp-atlassian's single-user global-credential fallback gate — it applies to any server-side auth type (our Cloud API tokens included), not just mTLS — and is required since 0.23.0 because our client sends no per-request Atlassian auth headers. Revisit it only if a later phase adds per-user Atlassian auth.
+**Atlassian server-side hardening (both launch paths — `run_atlassian_server.sh` and the compose service):** `READ_ONLY_MODE=true` blocks every write action; `TOOLSETS=all` keeps the full 58-tool set available (mcp-atlassian v0.22+ otherwise defaults to only 6 core toolsets once the default flips); `ENABLED_TOOLS=jira_get_issue,confluence_search,confluence_get_page` is an exact-name allowlist that mcp-atlassian enforces at both `tools/list` and call time (its `_is_tool_authorized`, v0.23.0). No review agent can ever reach the ~38 other Jira tools or ~20 other Confluence tools — not even a read like `jira_search`. This is the server-side half of the "no blanket Atlassian tools" guarantee; the client-side half is each agent's exact `allowed_names` set below (deliberately redundant, same as GitHub). `ALLOW_GLOBAL_CRED_FALLBACK=true` is mcp-atlassian's single-user global-credential fallback gate — it applies to any server-side auth type (our Cloud API tokens included), not just mTLS — and is required since 0.23.0 because our client sends no per-request Atlassian auth headers. Revisit it only if a later phase adds per-user Atlassian auth.
 
 **GitHub connection:** PAT via `Authorization: Bearer` header — simplest headless auth, no GitHub App/org setup required. OAuth is the alternative for a real multi-org deployment later, not needed now. Read-only is enforced twice, deliberately redundant: server-side via the `X-MCP-Readonly`/`X-MCP-Toolsets` headers above, and client-side via each agent's explicit `allowed_names` set below (see Per-Agent Breakdown) — no agent's tool list is ever "all GitHub tools."
 
@@ -155,7 +176,7 @@ Auth via env vars (`JIRA_URL`, `JIRA_USERNAME`, `JIRA_API_TOKEN`, plus the Confl
 
 ## Per-Agent Breakdown — Exact Tools and Why
 
-**GitHub tool names below must be re-verified against the live server before implementation.** GitHub's MCP tool registry has been consolidating and renaming tools (e.g. individual `create_issue`/`update_issue`-style tools merging into a unified `issue_write`, with newer granular feature-flagged variants alongside them). Confirm exact current names via `mcpcurl tools --help` or the server's own tool list before hardcoding `allowed_names` — don't carry these names forward from this doc unverified.
+**GitHub tool names are verified and hardcoded in `tool_lists.py`.** They were checked against the live GitHub MCP registry (30 tools, zero write-capable names) before implementation — the exact names used are `pull_request_read`, `get_file_contents`, `list_commits`, `search_code`, `list_code_scanning_alerts`, `get_code_scanning_alert`, `list_dependabot_alerts`, `get_dependabot_alert`, `actions_list`, `actions_get`, `get_job_logs`. Context7's tools are `resolve-library-id` and `query-docs`. If GitHub ever consolidates names again, re-verify with `mcpcurl tools --help` and update `tool_lists.py` — don't guess.
 
 ### Compliance
 **Role:** does this diff match what was asked (Jira) and follow team standards (Confluence)?
@@ -190,7 +211,7 @@ Auth via env vars (`JIRA_URL`, `JIRA_USERNAME`, `JIRA_API_TOKEN`, plus the Confl
 | `get_code_scanning_alert` | GitHub | Detail on a specific alert once flagged |
 | `list_dependabot_alerts` | GitHub | Known-vulnerable dependency versions |
 | `get_dependabot_alert` | GitHub | Detail on a specific dependency alert |
-| Context7 tools | Context7 | Is this API/library usage now known-insecure or deprecated |
+| `resolve-library-id`, `query-docs` | Context7 | Is this API/library usage now known-insecure or deprecated — **curated to these two read-only docs tools** (was "all Context7 tools"; trimmed to cut prompt noise and selection errors) |
 
 ### Performance
 **Role:** does this change risk a performance regression?
@@ -252,9 +273,12 @@ from pydantic import BaseModel
 class ReviewRequest(BaseModel):
     repo_id: str
     graph_commit_hash: str
-    request_type: str        # must match a key in the Routing Policy below
+    request_type: str        # must match a key in the Routing Policy below; the route 400s on unknown types
     diff_content: str | None = None   # optional — explain_question etc. may not need one
+    question: str | None = None       # optional — free-form question; steers any_question (available pool) AND the single-specialist question types (compliance_question / security_question / performance_question / impact_question). Ignored by review (full pipeline) and explain_question.
 ```
+
+`POST /review` returns `{"review_session_id": <int>, "result": <JSON string of the aggregated AgentOutput>}` and writes one `ReviewSession` row plus one `AgentExecution` row per routed subagent and one for the aggregator in the same Phase 1 SQLite DB.
 
 ## Pre-Flight: Graph Readiness + Workspace Path Resolution
 
@@ -283,11 +307,22 @@ def prepare_review_context(repo_id: str, graph_commit_hash: str) -> str:
 
 **Async note:** `graph_readiness_service` and the `RepoWorkspace` lookup are Phase 1 code — synchronous, by Phase 1's own design. Calling a sync DB read directly inside this phase's `async def` route would block the event loop for its duration. For a single fast SQLite read this is a minor, acceptable exception in practice — but if you want to keep the async layer strictly non-blocking, wrap the call: `await asyncio.to_thread(prepare_review_context, repo_id, graph_commit_hash)` from the route handler. Either is acceptable; pick one and be consistent, don't mix.
 
+**Implementation note:** Phase 1 defines `GraphReadinessService` but never instantiates it, so `prepare_review_context.py` constructs it with a local `_GraphSnapshotStatusQueryPort` shim (a direct `GraphSnapshot` query, the same query the webhook flow uses). The `RepoWorkspace` lookup is likewise a direct `select(RepoWorkspace)...` against the Phase 1 table.
+
 ## Agent Contracts
 
 ```python
 # domain/entities/agent_finding.py
 from dataclasses import dataclass, field
+
+@dataclass
+class AgentInput:
+    repo_id: str
+    graph_commit_hash: str
+    request_type: str
+    diff_content: str | None = None
+    repo_root: str = ""          # DB-resolved local_path from prepare_review_context
+    question: str | None = None  # free-form question for any_question; also forwarded for compliance/security/performance/impact question types
 
 @dataclass
 class AgentFinding:
@@ -302,6 +337,13 @@ class AgentFinding:
 class AgentOutput:
     agent_name: str
     findings: list[AgentFinding] = field(default_factory=list)
+
+@dataclass
+class ReviewResult:
+    """Outcome of one review run: the aggregated reply plus one output per
+    routed subagent (the audit trail needs both)."""
+    aggregated: AgentOutput
+    per_agent: list[AgentOutput] = field(default_factory=list)
 ```
 
 **Confidence threshold:** a finding below 0.6 is low-confidence. Since there's no Context Agent yet to fetch more history, a low-confidence finding this phase is just surfaced as-is with its score visible — do not build any "fetch more context" fallback behavior; that's future-phase territory.
@@ -316,6 +358,8 @@ result_json = json.dumps(dataclasses.asdict(agent_output))
 
 ## Routing Policy
 
+Implemented in `domain/review/routing_policy.py`. `agents_for_request(request_type)` returns a non-empty list (dispatch subagents), `[]` for a *valid* type the orchestrator answers directly, or `None` for an *unknown* type — the route converts `None` to a 400.
+
 ```yaml
 review:
   agents: [compliance, security, performance, regression]
@@ -323,14 +367,25 @@ review:
 security_question:
   agents: [security]
 
+compliance_question:
+  agents: [compliance]
+
+performance_question:
+  agents: [performance]
+
 impact_question:
   agents: [regression]
 
 explain_question:
   agents: []   # orchestrator answers directly
+
+any_question:   # user-approved extension (supervisor-demo requirement)
+  agents: [compliance, security, performance, regression]   # AVAILABLE POOL, not a required set
 ```
 
 `performance` must be present in the `review` entry — it was missing in an earlier draft of this policy; do not reproduce that omission.
+
+**`any_question` (user-approved extension):** the four specialists form an *available pool*, not a forced set. The orchestrator reads the free-form `question` and delegates to the specialist(s) whose domain it concerns — one, several, or none (answering directly when nothing matches). The user message spells out the pool + the question and lets the orchestrator choose; every other request type spells out a REQUIRED list the orchestrator MUST delegate to.
 
 ## Event Schema (log only, no UI consumer yet)
 
@@ -340,6 +395,8 @@ explain_question:
 { type: "tool_result", agent: "compliance", tool: "query_graph_tool", output: {...} }
 { type: "final", content: "..." }
 ```
+
+**Implemented extensions to the schema:** entries are JSON lines written to stdout (via `logging`, `EVENT <json>`) and appended to `logs/review_events.log` (file writes offloaded with `asyncio.to_thread`). Beyond the four spec events, the capture middleware adds `tool_call_attempt` (a tool call the model *emitted* — proving a `tool_call_attempt` with no matching `tool_call` means the runtime rejected it) and `invalid_tool_call` (a rejected/malformed call). Subagent-internal MCP calls are tagged with their owning agent via the `tool_scoping` wrapper. Path note: the log path is CWD-relative (`logs/review_events.log`), so it lands under the `backend/` directory when the app is launched from `backend/` (see `launch_uvicorn.cmd`).
 
 ---
 
@@ -352,7 +409,7 @@ backend/src/code_review_agent/
 │   ├── entities/
 │   │   ├── repo_workspace.py                  # (Phase 1, unchanged)
 │   │   ├── graph_build_status.py              # (Phase 1, unchanged)
-│   │   └── agent_finding.py                   # NEW — AgentFinding, AgentOutput
+│   │   └── agent_finding.py                   # NEW — AgentInput, AgentFinding, AgentOutput, ReviewResult
 │   ├── repo/
 │   │   └── repo_source_port.py                # (Phase 1, unchanged)
 │   ├── graph/
@@ -369,7 +426,7 @@ backend/src/code_review_agent/
 │       └── run_review.py                       # routes via routing_policy -> invokes ReviewOrchestratorPort
 │
 ├── infrastructure/                             # existing from Phase 1, extended
-│   ├── config.py                               # (Phase 1, extended with github_pat, context7_api_key, atlassian settings)
+│   ├── config.py                               # (Phase 1, extended with review_model, review_max_tokens, review_timeout, github_pat, context7_api_key, atlassian settings; extra="ignore")
 │   ├── repo_source/                            # (Phase 1, unchanged)
 │   ├── graph_builder/                          # (Phase 1, unchanged)
 │   ├── graph_service/                          # (Phase 1, unchanged)
@@ -380,7 +437,13 @@ backend/src/code_review_agent/
 │   ├── mcp_clients/                            # NEW
 │   │   └── mcp_client_factory.py               # builds the shared MultiServerMCPClient
 │   ├── agents_runtime/                         # NEW
-│   │   ├── orchestrator_runtime.py             # create_deep_agent(...) wiring
+│   │   ├── orchestrator_runtime.py             # one create_deep_agent root (orchestrator + aggregator); tolerant report parsing + bounded retry
+│   │   ├── harness_profile.py                  # safety HarnessProfile: strips 8 built-in tools, disables general-purpose subagent
+│   │   ├── capture.py                          # CaptureStore + SubagentCaptureMiddleware: real duration_ms + model-call events
+│   │   ├── report_schema.py                    # FindingItem/SubagentReport (Pydantic) — the deepagents response_format
+│   │   ├── tool_lists.py                       # AGENT_TOOL_PLAN: single source of per-agent tool names
+│   │   ├── tool_descriptions.py                # one-line description overrides (~70-80% token cut)
+│   │   ├── tool_scoping.py                     # scope_agent_tools + per-agent event-wrapped tools + 4k result truncation
 │   │   ├── prompts/
 │   │   │   ├── orchestrator.md
 │   │   │   ├── compliance.md
@@ -390,7 +453,7 @@ backend/src/code_review_agent/
 │   │   │   ├── fix_suggestion.md
 │   │   │   └── aggregator.md
 │   │   └── subagents/
-│   │       ├── compliance_runtime.py           # builds the compliance_agent dict, scoped tools
+│   │       ├── compliance_runtime.py           # build_*_spec(mcp_client, store) -> subagent dict + capture middleware
 │   │       ├── security_runtime.py
 │   │       ├── performance_runtime.py
 │   │       ├── regression_runtime.py
@@ -409,6 +472,8 @@ backend/src/code_review_agent/
 │
 └── docker-compose.yaml                         # extended: add the mcp-atlassian service alongside existing volumes
 ```
+
+Additive wiring beyond the tree: `main.py`'s existing lifespan now also runs a CRG connectivity check (`CRGServerManager.ensure_connected(timeout=10)` — a check, not a launcher) and builds the shared client once (`app.state.mcp_client = build_mcp_client()`), and the review router is included under `/api/v1`. All strictly additive — no Phase 1 logic was modified. (The Phase 1 do-not-modify allowance is `config.py`, `db/models.py`, `db/engine.py`; the `main.py` wiring is this phase's documented, additive exception.)
 
 **New DB tables** — same SQLite file as Phase 1, same `SQLModel` pattern. Do not stand up Postgres yet.
 
@@ -468,15 +533,19 @@ class AgentExecution(SQLModel, table=True):
 
 **Same fix applies to Phase 1's `RepoWorkspace`/`GraphSnapshot`/`GraphBuildStatus`** — they use the same deprecated `datetime.utcnow()` pattern. Not fixed here since it's outside this phase's scope, but worth doing before mixed naive/aware timestamps across tables in the same DB cause a real comparison bug — flag this in `OPENCODE.md` as a cross-phase cleanup item rather than leaving it unrecorded.
 
-**Exception boundary — required, not optional.** If an LLM call fails or an MCP tool call times out mid-review, an unhandled exception must not skip the audit trail. Wrap the orchestration call so a failure still writes an `AgentExecution` row (`result="error"`-equivalent, with the exception message) before the route returns a 500:
+**Exception boundary — required, not optional.** If an LLM call fails or an MCP tool call times out mid-review, an unhandled exception must not skip the audit trail. Implemented in `infrastructure/api/routes/review.py`: the orchestration call is wrapped so a failure still writes an `AgentExecution` row (`agent_name="orchestrator"`, `result` = `{"status": "error", "error": <str>}` — there is no separate `status`/`error` column) before the route returns a 500:
 
 ```python
 try:
-    output = await run_review(...)
+    outcome = await run_review(review_input, orchestrator)
+except HTTPException:
+    raise
 except Exception as exc:
-    await record_agent_execution(review_session_id, agent_name="orchestrator", status="error", error=str(exc))
+    await asyncio.to_thread(_record_error_execution, session_id, exc)
     raise HTTPException(status_code=500, detail="Review failed") from exc
 ```
+
+`HTTPException`s (e.g. the 400 for an unknown request_type) pass through untouched. The bounded retry inside `orchestrator_runtime._run_with_retry` runs *before* this boundary, so only genuinely unrecoverable failures reach the error row. `run_review` (Application layer) resolves the routed agent list and 400s on unknown types, making the route's pre-check a defensive double-check.
 
 ---
 
@@ -495,26 +564,31 @@ except Exception as exc:
 
 ## Definition of Done for This Phase
 
-- [ ] All 7 agents constructed via `create_deep_agent`, each subagent's `tools` list built by filtering `MultiServerMCPClient.get_tools()` output to exactly the names listed above — no agent has a tool outside its assigned set.
-- [ ] Fix Suggestion has `refactor_tool` but explicitly does NOT have `apply_refactor_tool`.
-- [ ] GitHub MCP client config includes `"X-MCP-Readonly": "true"` and a scoped `"X-MCP-Toolsets"` header — review agents never get a blanket "all GitHub tools" grant, server-side or client-side.
-- [ ] `mcp-atlassian` is hardened server-side in both launch paths (script + compose) with `READ_ONLY_MODE=true` and `ENABLED_TOOLS=jira_get_issue,confluence_search,confluence_get_page`, and client-side Compliance is scoped to exactly `{jira_get_issue, confluence_search, confluence_get_page}` while Fix Suggestion is scoped to exactly `{confluence_search, confluence_get_page}` — no agent gets a blanket "all Jira/all Confluence" grant, server-side or client-side.
-- [ ] Each GitHub-using agent's `allowed_names` set was checked against the live GitHub MCP tool registry (e.g. via `mcpcurl tools --help`) immediately before implementation, not copied from this doc unverified.
-- [ ] Routing Policy includes `performance` in the `review` entry.
-- [ ] `POST /review` validates its body against `ReviewRequest` (Pydantic, in `infrastructure/api/models.py` — not `domain/`).
-- [ ] `POST /review` calls `prepare_review_context` before dispatching any agent: returns 404 for an unknown `repo_id`, returns 425 if the graph isn't ready for `graph_commit_hash` — verified by testing both failure cases, not just the happy path.
-- [ ] Every subagent's `repo_root`/CRG tool calls use the `local_path` resolved from `RepoWorkspace` via `prepare_review_context` — never a guessed or independently-constructed filesystem path.
-- [ ] `POST /review` runs orchestrator → subagents (per routing policy) → aggregator, returns a structured result.
-- [ ] `MultiServerMCPClient` is constructed once at FastAPI startup (lifespan), not per-request.
-- [ ] Phase 2's new tables (`ReviewSession`, `AgentExecution`) actually exist at runtime — satisfied by Phase 1's existing `init_db()`/`create_all` wiring once they're added to `db/models.py`, not by new startup code.
-- [ ] A failed review still writes an `AgentExecution` row before returning a 500 — verified by forcing a failure (e.g. an invalid MCP URL) and checking the DB, not just reading the code.
-- [ ] `ReviewSession` and `AgentExecution` rows are written per review, in the same SQLite DB as Phase 1, using timezone-aware (`datetime.now(timezone.utc)`) timestamps, not naive ones.
-- [ ] `AgentExecution.result` is populated via `json.dumps(dataclasses.asdict(agent_output))`, not a raw `json.dumps(agent_output)` call.
-- [ ] `review_model` is read from `settings`, has no hardcoded default anywhere in code, and is set via the `REVIEW_MODEL` env var.
-- [ ] `tool_name_prefix` is left at its default (`False`) on `MultiServerMCPClient` — no prefix-stripping logic was added to `scoped()`.
-- [ ] `db/engine.py` sets `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on connection — required this phase due to `AgentExecution`'s higher write frequency, not optional.
-- [ ] Event schema entries are logged (stdout/file) for thinking/tool_call/tool_result/final — no UI required.
-- [ ] `mcp-atlassian` runs via `uvx mcp-atlassian --transport streamable-http --port 9000`, not the official Rovo server.
-- [ ] Domain layer has zero imports of `deepagents`, `langchain_mcp_adapters`, or `fastapi`.
-- [ ] Nothing from Phase 1's folder tree was deleted or modified except `config.py`, `db/models.py`, and `db/engine.py` (all extended, not replaced).
-- [ ] No LangMem, no Context Agent, no conversation persistence tables, no frontend.
+Items below are marked against the *implemented* state (verified in code and live E2E; evidence in `OPENCODE.md`).
+
+- [x] All 7 agents constructed via `create_deep_agent`: the root agent is the Orchestrator+Aggregator (classify/synthesize phases, `system_prompt` = `orchestrator.md` + `aggregator.md`), and the 5 specialists are registered as plain dict literals in `subagents` via per-agent `build_*_spec()` builders. `response_format=SubagentReport` is set on the root and propagates to every subagent. For an empty routed set (`explain_question`) `subagents=None` — no subagents constructed.
+- [x] Each subagent's `tools` list is built by `scope_agent_tools` filtering `MultiServerMCPClient.get_tools()` output to exactly the names in `AGENT_TOOL_PLAN` — no agent has a tool outside its assigned set. (Security's Context7 grant is curated to `{resolve-library-id, query-docs}`; Compliance and Regression take zero Context7 tools; Performance and Fix Suggestion take all Context7 tools.)
+- [x] Fix Suggestion has `refactor_tool` but explicitly does NOT have `apply_refactor_tool`.
+- [x] The safety `HarnessProfile` strips all 8 built-in tools (`ls`/`read_file`/`write_file`/`edit_file`/`delete`/`glob`/`grep`/`execute`) and disables the general-purpose subagent from every stack — registered under every key deepagents resolves (raw spec + resolved `provider:identifier`).
+- [x] GitHub MCP client config includes `"X-MCP-Readonly": "true"` and a scoped `"X-MCP-Toolsets"` header — review agents never get a blanket "all GitHub tools" grant, server-side or client-side.
+- [x] `mcp-atlassian` is hardened server-side in both launch paths (script + compose) with `READ_ONLY_MODE=true`, `TOOLSETS=all`, `ALLOW_GLOBAL_CRED_FALLBACK=true`, and `ENABLED_TOOLS=jira_get_issue,confluence_search,confluence_get_page`; client-side Compliance is scoped to exactly `{jira_get_issue, confluence_search, confluence_get_page}` while Fix Suggestion is scoped to exactly `{confluence_search, confluence_get_page}` — no agent gets a blanket "all Jira/all Confluence" grant, server-side or client-side.
+- [x] Each GitHub-using agent's `allowed_names` set was checked against the live GitHub MCP tool registry (e.g. via `mcpcurl tools --help`) before implementation, not copied from this doc unverified — verified names recorded in `tool_lists.py`.
+- [x] Routing Policy includes `performance` in the `review` entry, the single-specialist types `security_question`/`compliance_question`/`performance_question`/`impact_question` (one specialist each), `explain_question` (direct answer), and the user-approved `any_question` extension (available-pool semantics; unknown request types → `None` → 400).
+- [x] `POST /review` validates its body against `ReviewRequest` (Pydantic, in `infrastructure/api/models.py` — not `domain/`), including the optional `question` field.
+- [x] `POST /review` calls `prepare_review_context` before dispatching any agent: returns 404 for an unknown `repo_id`, returns 425 if the graph isn't ready for `graph_commit_hash` — verified by testing both failure cases, not just the happy path.
+- [x] Every subagent's `repo_root`/CRG tool calls use the `local_path` resolved from `RepoWorkspace` via `prepare_review_context` — never a guessed or independently-constructed filesystem path. The orchestrator's user message hands every `task` call BOTH `owner`/`repo` (GitHub tools) AND `repo_root` (CRG tools).
+- [x] `POST /review` runs orchestrator → subagents (per routing policy) → aggregator, returns `{"review_session_id": <int>, "result": <aggregated AgentOutput JSON>}`.
+- [x] `MultiServerMCPClient` is constructed once at FastAPI startup (lifespan), not per-request.
+- [x] Phase 2's new tables (`ReviewSession`, `AgentExecution`) actually exist at runtime — satisfied by Phase 1's existing `init_db()`/`create_all` wiring once they were added to `db/models.py`, not by new startup code.
+- [x] A failed review still writes an `AgentExecution` row before returning a 500 — verified by forcing a failure (e.g. an invalid MCP URL) and checking the DB, not just reading the code.
+- [x] `ReviewSession` and `AgentExecution` rows are written per review, in the same SQLite DB as Phase 1, using timezone-aware (`datetime.now(timezone.utc)`) timestamps. (SQLite round-trip stores naive wall time — cross-phase cleanup tracked in `OPENCODE.md`.)
+- [x] `AgentExecution.result` is populated via `json.dumps(dataclasses.asdict(agent_output))`, not a raw `json.dumps(agent_output)` call; per-agent rows carry real `duration_ms` via the capture middleware, and the aggregator row carries the whole-run wall time.
+- [x] `review_model` is read from `settings`, has no hardcoded default anywhere in code, and is set via the `REVIEW_MODEL` env var. `review_max_tokens`/`review_timeout` are likewise env-configurable and forwarded through a `ProviderProfile`.
+- [x] `tool_name_prefix` is left at its default (`False`) on `MultiServerMCPClient` — no prefix-stripping logic was added to `scoped()`.
+- [x] `db/engine.py` sets `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on connection — required this phase due to `AgentExecution`'s higher write frequency, not optional.
+- [x] Event schema entries are logged (stdout + `logs/review_events.log`) for thinking/tool_call/tool_result/final plus the extended `tool_call_attempt`/`invalid_tool_call` — no UI required.
+- [x] `mcp-atlassian` runs via `uvx mcp-atlassian --transport streamable-http --port 9000`, not the official Rovo server.
+- [x] Domain layer has zero imports of `deepagents`, `langchain_mcp_adapters`, `pydantic`, or `fastapi`.
+- [x] Nothing from Phase 1's folder tree was deleted or modified except `config.py`, `db/models.py`, and `db/engine.py` (all extended, not replaced), plus the strictly-additive `main.py` wiring (review-router include, `app.state.mcp_client`, CRG connectivity check).
+- [x] No LangMem, no Context Agent, no conversation persistence tables, no frontend, no streaming.
+- [x] **Phase 3 sign-off still pending** — reviewer final pass was 29/30; the single minor FAIL (Compliance's Context7 grant) is FIXED.

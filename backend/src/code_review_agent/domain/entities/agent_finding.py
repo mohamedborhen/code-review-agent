@@ -8,6 +8,7 @@ class AgentInput:
     request_type: str
     diff_content: str | None = None
     repo_root: str = ""
+    question: str | None = None
 
 
 @dataclass

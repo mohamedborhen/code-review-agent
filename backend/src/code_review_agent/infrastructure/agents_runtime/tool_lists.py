@@ -101,7 +101,7 @@ AGENT_TOOL_PLAN: Final[dict[str, dict[str, set[str] | None]]] = {
         },
         "github": GITHUB["security"],
         "atlassian": set(),
-        "context7": None,
+        "context7": {"resolve-library-id", "query-docs"},
     },
     "performance": {
         "crg": {

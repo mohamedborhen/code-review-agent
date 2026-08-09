@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     # var must be available. Never hardcode a model string in code; that relocates
     # staleness instead of removing it.
     review_model: str
+    # Output-token budget per model call, forwarded to the provider as
+    # `max_tokens`. No default cap exists in code; deepagents/openrouter resolve
+    # "unset" to the model's full output window (16k for gpt-4o-mini), which the
+    # OpenRouter free tier rejects ("...can only afford 15683"). Config-driven so
+    # it is not a hardcoded value and can be raised when credits permit.
+    review_max_tokens: int = 2000
+    # Per-model-call timeout in seconds, forwarded to the provider as `timeout`.
+    # Free-tier hosts (e.g. NVIDIA NIM) can exceed the previous hardcoded 240s on
+    # a single long-reasoning turn, which surfaced as "Timeout on reading data
+    # from socket" mid-review. Config-driven so it is not a hardcoded value.
+    review_timeout: int = 600
     # Required, no default — used for the GitHub MCP server's Bearer auth header.
     github_pat: str
     # Optional — GitHub Copilot MCP's Context7 server sends the key as a header

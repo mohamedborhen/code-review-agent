@@ -57,6 +57,7 @@ async def review(request: Request, body: ReviewRequest) -> dict:
         request_type=body.request_type,
         diff_content=body.diff_content,
         repo_root=repo_root,
+        question=body.question,
     )
 
     orchestrator = OrchestratorRuntime(request.app.state.mcp_client)

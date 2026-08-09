@@ -19,7 +19,11 @@ import json
 import logging
 import re
 
-from deepagents import create_deep_agent
+from deepagents import (
+    ProviderProfile,
+    create_deep_agent,
+    register_provider_profile,
+)
 from langchain_core.messages import AIMessage, ToolMessage
 
 from domain.entities.agent_finding import AgentFinding, AgentInput, AgentOutput, ReviewResult
@@ -47,6 +51,35 @@ _SUBAGENT_BUILDERS = {
 
 _ALL_SUBAGENTS = list(_SUBAGENT_BUILDERS)
 
+# Typed request types that carry an optional user question: the single-
+# specialist questions (compliance/security/performance/impact) now forward the
+# `question` field so the user can steer the specialist (e.g. a ticket key to
+# check). `review` (full pipeline) and `explain_question` (direct answer) are
+# intentionally not included; use `any_question` for free-form steering there.
+_QUESTION_CARRYING_TYPES = frozenset(
+    {"compliance_question", "security_question", "performance_question", "impact_question"}
+)
+
+
+def _ensure_review_provider_profile() -> None:
+    """Cap output tokens via a deepagents ProviderProfile.
+
+    Registered under the exact `settings.review_model` key so deepagents'
+    resolve_model forwards `max_tokens` to init_chat_model while the model
+    stays a STRING — preserving the exact-key HarnessProfile lookup (see
+    harness_profile.py). Keeps the OpenRouter free tier from rejecting the
+    model's full 16k output window as unaffordable.
+    """
+    register_provider_profile(
+        settings.review_model,
+        ProviderProfile(
+            init_kwargs={
+                "max_tokens": settings.review_max_tokens,
+                "timeout": settings.review_timeout,
+            }
+        ),
+    )
+
 
 class OrchestratorRuntime:
     """Builds and runs the deep agent (orchestrator + aggregator in one)."""
@@ -57,6 +90,7 @@ class OrchestratorRuntime:
 
     async def run_review(self, review_input: AgentInput, agent_names: list[str]) -> ReviewResult:
         ensure_review_harness_profile()
+        _ensure_review_provider_profile()
 
         subagent_specs = []
         if agent_names:
@@ -85,6 +119,29 @@ class OrchestratorRuntime:
 
 
 def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str:
+    if review_input.request_type == "any_question":
+        pool = ", ".join(agent_names) if agent_names else "(none)"
+        lines = [
+            f"Request type: {review_input.request_type}",
+            f"Repo: {review_input.repo_id}",
+            f"Graph commit hash: {review_input.graph_commit_hash}",
+            f"Repo root (local path): {review_input.repo_root}",
+            "",
+            "Subagents need BOTH the repo identifier (owner/name from `Repo:`) for "
+            "their GitHub tools AND the repo-root path (from `Repo root (local path):`) "
+            "for their CRG tools. Include both in every task description, never omit one.",
+            "",
+            "Question from the user:",
+            review_input.question or "(no question provided)",
+            "",
+            "Available subagents (delegate to the one(s) relevant to this question — "
+            "one, several, or none if it is answerable directly):",
+            pool,
+            "",
+            "Investigate, then synthesize the answer into a single SubagentReport JSON.",
+        ]
+        return "\n".join(lines)
+
     required = ", ".join(agent_names) if agent_names else "(none — answer directly)"
     lines = [
         f"Request type: {review_input.request_type}",
@@ -92,15 +149,31 @@ def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str
         f"Graph commit hash: {review_input.graph_commit_hash}",
         f"Repo root (local path): {review_input.repo_root}",
         "",
+        "Subagents need BOTH the repo identifier (owner/name from `Repo:`) for "
+        "their GitHub tools AND the repo-root path (from `Repo root (local path):`) "
+        "for their CRG tools. Include both in every task description, never omit one.",
+        "",
         "Required subagents for this request type (you MUST delegate to each):",
         required,
-        "",
-        "Diff:",
-        review_input.diff_content or "(no diff provided)",
-        "",
-        "Classify the request, delegate to every required subagent, then synthesize all "
-        "reports into a single SubagentReport JSON.",
     ]
+    if review_input.request_type in _QUESTION_CARRYING_TYPES and review_input.question:
+        lines.extend(
+            [
+                "",
+                "Question from the user:",
+                review_input.question,
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Diff:",
+            review_input.diff_content or "(no diff provided)",
+            "",
+            "Classify the request, delegate to every required subagent, then synthesize all "
+            "reports into a single SubagentReport JSON.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -137,6 +210,7 @@ def _parse_aggregated(result: dict) -> AgentOutput:
     structured = result.get("structured_response")
     if isinstance(structured, SubagentReport):
         return AgentOutput(agent_name="aggregator", findings=_to_agent_output(structured).findings)
+    from_dict: AgentOutput | None = None
     if isinstance(structured, dict):
         try:
             report = SubagentReport.model_validate(structured)
@@ -146,17 +220,71 @@ def _parse_aggregated(result: dict) -> AgentOutput:
         try:
             report = _coerce_report(json.dumps(structured), "aggregator")
             report.agent_name = "aggregator"
-            return AgentOutput(agent_name="aggregator", findings=_to_agent_output(report).findings)
+            from_dict = AgentOutput(agent_name="aggregator", findings=_to_agent_output(report).findings)
         except Exception:
             logger.warning("Aggregator structured response did not match SubagentReport schema")
+    # Weak-model fallback: deepagents occasionally returns the aggregator report
+    # as plain final-message content instead of a native structured response
+    # (session 50 — full findings in the `final` event but findings:[] in the
+    # API). Parse the last AIMessage content through the same lenient path used
+    # for subagent tool messages, and prefer it whenever it carries findings —
+    # otherwise an empty dict structured response (`{}`) would short-circuit
+    # with zero findings and throw the real report away.
+    from_messages = _parse_aggregated_from_messages(result)
+    if from_messages is not None and from_messages.findings:
+        return from_messages
+    if from_dict is not None:
+        return from_dict
+    if from_messages is not None:
+        return from_messages
     logger.warning("No structured_response in orchestrator result; returning empty aggregated output")
     return AgentOutput(agent_name="aggregator")
+
+
+def _parse_aggregated_from_messages(result: dict) -> AgentOutput | None:
+    """Parse the aggregator report from the last AIMessage content, if any.
+
+    Mirror of `_parse_tool_message`: strip fences/XML, coerce leniently, and
+    return None only when no message parses (caller then falls back to empty).
+    """
+    for msg in reversed(result.get("messages", [])):
+        if not isinstance(msg, AIMessage) or not msg.content:
+            continue
+        try:
+            report = _coerce_report(_extract_json(str(msg.content)), "aggregator")
+            report.agent_name = "aggregator"
+            return AgentOutput(agent_name="aggregator", findings=_to_agent_output(report).findings)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_json(text: str) -> str:
+    """Pull a JSON block out of a fenced/prose subagent reply.
+
+    Subagents regularly wrap their JSON report in a markdown code fence
+    (``**SubagentReport**\\n\\n```json ... `````) or an XML-style tag
+    (``<subagent_report> ... </subagent_report>``), which makes ``json.loads``
+    fail and silently empties their AgentExecution row. Strip the wrapper before
+    parsing so the strict path still gets first crack at the real JSON.
+    """
+    match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    match = re.search(
+        r"<(?:subagent_report|report|result)\b[^>]*>(.*?)"
+        r"</(?:subagent_report|report|result)>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else text
 
 
 def _parse_tool_message(agent_name: str, content) -> AgentOutput:
     if not content:
         return AgentOutput(agent_name=agent_name)
     text = content.content if hasattr(content, "content") else str(content)
+    text = _extract_json(text)
     try:
         raw = json.loads(text)
     except Exception:
@@ -230,12 +358,32 @@ def _coerce_finding(item: dict) -> FindingItem:
         confidence = 0.5
     confidence = min(1.0, max(0.0, confidence))
 
+    evidence_raw = item.get("evidence")
+    if not evidence_raw:
+        evidence_raw = item.get("location")
     evidence: list[str] = []
-    for e in item.get("evidence") or []:
-        if isinstance(e, str):
-            evidence.append(e)
-        else:
-            evidence.append(json.dumps(e, ensure_ascii=False, default=str))
+    if isinstance(evidence_raw, str):
+        evidence = [evidence_raw]
+    else:
+        for e in evidence_raw or []:
+            if isinstance(e, str):
+                evidence.append(e)
+            else:
+                evidence.append(json.dumps(e, ensure_ascii=False, default=str))
+
+    if confidence == 0.5 and item.get("risk_score") is not None:
+        try:
+            confidence = min(1.0, max(0.0, float(item["risk_score"]) / 10.0))
+        except (TypeError, ValueError):
+            pass
+
+    recommendation = item.get("recommendation")
+    if not recommendation:
+        recommendations = item.get("recommendations")
+        if isinstance(recommendations, list):
+            recommendation = "\n".join(str(r) for r in recommendations)
+        elif recommendations:
+            recommendation = str(recommendations)
 
     return FindingItem(
         severity=str(item.get("severity", "info")).lower(),
@@ -243,15 +391,38 @@ def _coerce_finding(item: dict) -> FindingItem:
         title=str(item.get("title") or item.get("id") or ""),
         description=str(item.get("description", "")),
         evidence=evidence,
-        recommendation=str(item.get("recommendation", "")),
+        recommendation=str(recommendation or ""),
     )
+
+
+def _findings_list(raw: dict) -> list | None:
+    """Locate the findings array under any of the shapes subagents emit.
+
+    Subagents nest reports under domain keys (``security_review``,
+    ``compliance_report``, ...) and vary the array name (``findings``,
+    ``violations``, ``security_findings``, ...). Recurse one level into nested
+    dicts so a report like ``{"security_review": {"findings": [...]}}`` parses.
+    """
+    for key in ("findings", "violations"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            return value
+    for key, value in raw.items():
+        if key.endswith("findings") and isinstance(value, list):
+            return value
+    for value in raw.values():
+        if isinstance(value, dict):
+            nested = _findings_list(value)
+            if nested is not None:
+                return nested
+    return None
 
 
 def _coerce_report(text: str, agent_name: str) -> SubagentReport:
     raw = json.loads(text)
     if not isinstance(raw, dict):
         return SubagentReport(agent_name=agent_name)
-    findings_raw = raw.get("findings") or raw.get("violations") or []
+    findings_raw = _findings_list(raw) or []
     findings = [
         _coerce_finding(item)
         for item in findings_raw

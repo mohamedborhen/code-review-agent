@@ -2,9 +2,12 @@
 
 import time
 from pathlib import Path
+from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel
 
+from infrastructure.agents_runtime.tool_descriptions import TOOL_DESCRIPTION_OVERRIDES
 from infrastructure.agents_runtime.tool_lists import AGENT_TOOL_PLAN
 from infrastructure.event_bus.log_event_bus import log_event
 from infrastructure.mcp_clients.mcp_client_factory import scoped
@@ -19,6 +22,79 @@ def load_prompt(name: str) -> str:
 
 def _truncate(text: str, limit: int = 2000) -> str:
     return text if len(text) <= limit else text[:limit] + "...(truncated)"
+
+
+# Cap on the tool result that is fed BACK to the model. CRG calls
+# (get_review_context_tool with include_source, detect_changes_tool, ...) can
+# return tens of kilobytes of JSON; once returned, it sits in the conversation
+# history and is re-sent on every subsequent turn, compounding the token cost.
+# The event log keeps its own tighter cap (_truncate above); this one is what
+# the model actually sees.
+_TOOL_RESULT_MAX_CHARS = 4000
+
+
+def _truncate_result(result: object) -> object:
+    if isinstance(result, str):
+        return _truncate(result, _TOOL_RESULT_MAX_CHARS)
+    text = str(result)
+    if len(text) <= _TOOL_RESULT_MAX_CHARS:
+        return result
+    return text[:_TOOL_RESULT_MAX_CHARS] + "...(truncated)"
+
+
+def _is_null_schema(node: object) -> bool:
+    return isinstance(node, dict) and node.get("type") == "null"
+
+
+def _strip_null_unions(node: Any) -> Any:
+    """Recursively remove ``{"type": "null"}`` branches from ``anyOf``.
+
+    OpenAI-style strict tool-call validation rejects schemas where an optional
+    parameter serializes as ``anyOf: [X, {"type": "null"}]`` even when the call
+    itself is valid. Optional MCP parameters generate exactly this shape, so the
+    null branch is stripped. A single-element ``anyOf`` is unwrapped, merging
+    sibling keys (titles, defaults, descriptions) into the surviving member so
+    the schema keeps its original meaning.
+    """
+    if isinstance(node, list):
+        return [_strip_null_unions(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    cleaned: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "anyOf":
+            members = [_strip_null_unions(item) for item in value]
+            members = [item for item in members if not _is_null_schema(item)]
+            if not members:
+                cleaned[key] = [{"type": "null"}]
+            elif len(members) == 1 and isinstance(members[0], dict):
+                merged = dict(members[0])
+                for other_key, other_value in node.items():
+                    if other_key != "anyOf":
+                        merged[other_key] = _strip_null_unions(other_value)
+                cleaned.update(merged)
+            else:
+                cleaned[key] = members
+        elif isinstance(value, (dict, list)):
+            cleaned[key] = _strip_null_unions(value)
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def _with_clean_schema(schema: Any) -> Any:
+    """Return a tool args schema free of ``anyOf``-null unions.
+
+    ``StructuredTool.args_schema`` accepts either a pydantic model or a plain
+    JSON-schema dict (verified against langchain-core 1.5.3), so both are
+    normalized to a cleaned dict — no model rebuild needed.
+    """
+    if isinstance(schema, dict):
+        return _strip_null_unions(schema)
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        return _strip_null_unions(schema.model_json_schema())
+    return schema
 
 
 def _wrap_with_events(tool: BaseTool, agent_name: str) -> BaseTool:
@@ -57,13 +133,13 @@ def _wrap_with_events(tool: BaseTool, agent_name: str) -> BaseTool:
             tool=tool.name,
             output=_truncate(str(result)),
         )
-        return result
+        return _truncate_result(result)
 
     return StructuredTool.from_function(
         coroutine=_wrapped,
         name=tool.name,
-        description=tool.description,
-        args_schema=tool.args_schema,
+        description=TOOL_DESCRIPTION_OVERRIDES.get(tool.name, tool.description),
+        args_schema=_with_clean_schema(tool.args_schema),
         handle_tool_error=tool.handle_tool_error,
         return_direct=tool.return_direct,
     )
