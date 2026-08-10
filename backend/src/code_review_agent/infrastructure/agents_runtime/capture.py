@@ -30,6 +30,8 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
+from deepagents._models import get_model_identifier
+
 from infrastructure.event_bus.log_event_bus import _append_to_file, log_event
 
 logger = logging.getLogger(__name__)
@@ -41,11 +43,24 @@ def _truncate(text: str, limit: int = _CAPTURE_CONTENT_MAX_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "...(truncated)"
 
 
+def _model_label(model: object) -> str:
+    """Best-effort model identifier for event/timeline labelling."""
+    try:
+        identifier = get_model_identifier(model)  # type: ignore[arg-type]
+        if identifier:
+            return str(identifier)
+    except Exception:  # noqa: BLE001 - best-effort labelling must never break a review
+        pass
+    return str(getattr(model, "model_id", None) or "unknown")
+
+
 class CaptureStore:
     """Per-request capture buffer shared by subagent middleware and the route."""
 
     def __init__(self) -> None:
         self._durations: dict[str, list[int]] = {}
+        self._models: dict[str, str] = {}
+        self._timeline: dict[str, list[dict]] = {}
 
     def record_duration(self, agent_name: str, duration_ms: int) -> None:
         self._durations.setdefault(agent_name, []).append(duration_ms)
@@ -55,6 +70,22 @@ class CaptureStore:
         if not pending:
             return 0
         return pending.pop(0)
+
+    def record_model(self, agent_name: str, model: str) -> None:
+        self._models.setdefault(agent_name, model)
+
+    def consume_model(self, agent_name: str) -> str | None:
+        return self._models.get(agent_name)
+
+    def record_call(self, agent_name: str, kind: str, name: str, duration_ms: int) -> None:
+        self._timeline.setdefault(agent_name, []).append(
+            {"kind": kind, "name": name, "duration_ms": duration_ms}
+        )
+
+    def consume_timeline(self) -> dict[str, list[dict]]:
+        timeline = self._timeline
+        self._timeline = {}
+        return timeline
 
 
 class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -87,7 +118,9 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         return None
 
     def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        start = time.monotonic()
         response = handler(request)
+        self._record_call(request, int((time.monotonic() - start) * 1000))
         for entry in self._build_entries(response):
             line = json.dumps(entry, default=str)
             logger.info("EVENT %s", line)
@@ -95,7 +128,9 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         return response
 
     async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+        start = time.monotonic()
         response = await handler(request)
+        await self._arecord_call(request, int((time.monotonic() - start) * 1000))
         for entry in self._build_entries(response):
             await log_event(
                 entry["type"],
@@ -105,6 +140,23 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
                 input_=entry.get("input"),
             )
         return response
+
+    def _record_call(self, request: Any, duration_ms: int) -> None:
+        model = _model_label(getattr(request, "model", None))
+        self._store.record_call(self._agent_name, "llm", model, duration_ms)
+        self._store.record_model(self._agent_name, model)
+        line = json.dumps(
+            {"type": "llm_call", "agent": self._agent_name, "content": model, "duration_ms": duration_ms},
+            default=str,
+        )
+        logger.info("EVENT %s", line)
+        _append_to_file(line)
+
+    async def _arecord_call(self, request: Any, duration_ms: int) -> None:
+        model = _model_label(getattr(request, "model", None))
+        self._store.record_call(self._agent_name, "llm", model, duration_ms)
+        self._store.record_model(self._agent_name, model)
+        await log_event("llm_call", agent=self._agent_name, content=model, duration_ms=duration_ms)
 
     def _build_entries(self, response: Any) -> list[dict]:
         """Turn one model response into event-log entries for this subagent."""

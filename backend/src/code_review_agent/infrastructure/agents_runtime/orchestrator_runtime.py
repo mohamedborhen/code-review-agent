@@ -15,6 +15,7 @@ Design notes:
   agents hold exactly their scoped MCP tools (plus the root's `task` tool).
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -29,6 +30,12 @@ from langchain_core.messages import AIMessage, ToolMessage
 from domain.entities.agent_finding import AgentFinding, AgentInput, AgentOutput, ReviewResult
 from infrastructure.agents_runtime.capture import CaptureStore
 from infrastructure.agents_runtime.harness_profile import ensure_review_harness_profile
+from infrastructure.agents_runtime.middleware import (
+    DiffInjectionMiddleware,
+    RootTimingMiddleware,
+    TransientRetryMiddleware,
+    _is_transient_provider_error,
+)
 from infrastructure.agents_runtime.report_schema import FindingItem, SubagentReport
 from infrastructure.agents_runtime.subagents.compliance_runtime import build_compliance_spec
 from infrastructure.agents_runtime.subagents.fix_suggestion_runtime import build_fix_suggestion_spec
@@ -95,16 +102,27 @@ class OrchestratorRuntime:
         subagent_specs = []
         if agent_names:
             for name in _ALL_SUBAGENTS:
-                subagent_specs.append(await _SUBAGENT_BUILDERS[name](self._mcp_client, self.capture))
+                spec = await _SUBAGENT_BUILDERS[name](self._mcp_client, self.capture)
+                middleware = list(spec.get("middleware") or [])
+                middleware.append(TransientRetryMiddleware())
+                spec["middleware"] = middleware
+                subagent_specs.append(spec)
 
         system_prompt = load_prompt("orchestrator") + "\n\n" + load_prompt("aggregator")
         user_message = _build_user_message(review_input, agent_names)
+
+        root_middleware = [
+            RootTimingMiddleware(self.capture),
+            DiffInjectionMiddleware(review_input.diff_content),
+            TransientRetryMiddleware(),
+        ]
 
         agent = create_deep_agent(
             model=settings.review_model,
             system_prompt=system_prompt,
             subagents=subagent_specs or None,
             response_format=SubagentReport,
+            middleware=root_middleware,
         )
 
         result = await _run_with_retry(agent, user_message)
@@ -167,8 +185,9 @@ def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str
     lines.extend(
         [
             "",
-            "Diff:",
-            review_input.diff_content or "(no diff provided)",
+            "The complete, unmodified diff for this review is appended automatically to every "
+            "task description by the system — you must not reproduce, summarize, abbreviate, "
+            "or reference the diff text yourself.",
             "",
             "Classify the request, delegate to every required subagent, then synthesize all "
             "reports into a single SubagentReport JSON.",
@@ -317,14 +336,21 @@ _STRING_CONFIDENCE: dict[str, float] = {
 _STRUCTURED_OUTPUT_FAILURE = re.compile(r"structured output|json|parse", re.IGNORECASE)
 
 
-async def _run_with_retry(agent, user_message: str, attempts: int = 2) -> dict:
-    """Run the deep agent, retrying once on transient structured-output failures.
+async def _run_with_retry(agent, user_message: str, attempts: int = 3) -> dict:
+    """Run the deep agent, retrying transient + structured-output failures.
 
-    The configured review model occasionally returns an empty/invalid native
-    structured output (a weak-model failure mode observed during E2E), which
-    deepagents surfaces as a parse error inside ``ainvoke``. That is transient
-    and not a code defect, so retry before falling through to the 500 boundary.
-    Unrelated exceptions propagate immediately.
+    Two failure classes are retried, each with a cadence matching its nature:
+
+    - Provider-transient errors (429 / 5xx / rate limit / quota / socket
+      timeout) — exponential backoff. These are mostly absorbed earlier by
+      ``TransientRetryMiddleware`` at the individual model-call level; this
+      whole-run retry is the outer safety net.
+    - Structured-output parse failures (a weak-model failure mode observed
+      during E2E, where the configured model returns an empty/invalid native
+      structured output that deepagents surfaces as a parse error) — short
+      delay, since they are not quota-bound.
+
+    Everything else propagates immediately.
     """
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -332,10 +358,20 @@ async def _run_with_retry(agent, user_message: str, attempts: int = 2) -> dict:
             return await agent.ainvoke({"messages": [{"role": "user", "content": user_message}]})
         except Exception as exc:  # noqa: BLE001 - deliberate broad catch for retry classification
             last = exc
-            if not _STRUCTURED_OUTPUT_FAILURE.search(str(exc)):
+            transient = _is_transient_provider_error(exc)
+            structured = bool(_STRUCTURED_OUTPUT_FAILURE.search(str(exc)))
+            if not (transient or structured):
                 raise
             if attempt < attempts:
-                logger.warning("Transient structured-output failure (attempt %s/%s): %s", attempt, attempts, exc)
+                delay = (2.0 * (2 ** (attempt - 1)) + 0.5) if transient else 0.5
+                logger.warning(
+                    "Retrying review run (attempt %s/%s) after %s: %s",
+                    attempt,
+                    attempts,
+                    "transient provider error" if transient else "structured-output failure",
+                    exc,
+                )
+                await asyncio.sleep(delay)
     raise last  # type: ignore[misc]
 
 

@@ -73,8 +73,9 @@ Each subagent dict's `tools` list must contain LangChain `BaseTool` objects, not
 - **One root deep agent, not two.** The Orchestrator and Aggregator are a single `create_deep_agent` root whose `system_prompt` is `orchestrator.md` + `aggregator.md` concatenated: the root's classify phase is the Orchestrator, its synthesis phase the Aggregator. `response_format=SubagentReport` is set on the root and deepagents propagates it to every subagent, so each subagent's `ToolMessage` content is the JSON serialization of a `SubagentReport` (that is what per-agent audit rows are parsed from).
 - **Subagents built by per-agent builder functions** (`subagents/*_runtime.py`, each `build_*_spec(mcp_client, store)` returning a plain dict literal — not a typed class). All five specialists are registered whenever the routed set is non-empty (`fix_suggestion` is available on demand; the orchestrator decides whether to use it); for an empty routed set (`explain_question`) `subagents=None` — no subagents are constructed at all.
 - **Safety harness profile (`harness_profile.py`).** `create_deep_agent` always injects a built-in tool suite (`ls`, `read_file`, `write_file`, `edit_file`, `delete`, `glob`, `grep`, `execute`); the `tools` parameter is strictly additive and cannot remove them. A `HarnessProfile` with `excluded_tools` strips all eight and disables the general-purpose subagent. The profile is registered under EVERY key deepagents may resolve (the raw model spec AND the pre-built path's resolved `provider:identifier`), so no agent — root or subagent — ever holds a write/execute-capable built-in tool. `task` is deliberately retained: the orchestrator needs it to delegate.
-- **Per-subagent capture (`capture.py`).** Each subagent spec gets a `SubagentCaptureMiddleware`, which times the run (real `duration_ms` into a `CaptureStore`) and wraps the model call to emit the subagent's own reasoning and attempted/rejected tool calls as events.
-- **Tolerant report parsing + bounded retry (in `orchestrator_runtime.py`).** The configured free-tier model drifts from the exact report shape run to run (markdown-fenced JSON, `<subagent_report>` XML wrappers, nested `{"security_review": {"findings": [...]}}`, `violations`/`security_findings` aliases, string confidences, `location`/`risk_score`/`recommendations` synonyms). Strict `SubagentReport` validation is attempted first; `_extract_json`/`_findings_list`/`_coerce_finding`/`_coerce_report` recover the rest so per-agent `AgentExecution` rows carry real findings. `_run_with_retry` re-runs the agent once on transient deepagents structured-output parse failures (a weak-model empty-native-output 500 observed once), unrelated exceptions propagate to the 500 boundary immediately.
+- **Per-agent capture (`capture.py` + `middleware.py`).** Each subagent spec gets a `SubagentCaptureMiddleware`, which wraps every model call to time it (real per-LLM-call `duration_ms` into a `CaptureStore`) and emit the subagent's own reasoning and attempted/rejected tool calls as events; the first model id seen is recorded per agent and written to the `AgentExecution.model` column. The root gets `RootTimingMiddleware` (times each root/orchestrator LLM call) and `DiffInjectionMiddleware` (injects the canonical diff into every `task` tool-call description — see the orchestrator note above). After a run the route drains `CaptureStore.consume_timeline()` into the `timeline`/`timeline_text` response fields.
+- **Resilience (`middleware.py` + `orchestrator_runtime.py`).** `TransientRetryMiddleware` (root) and `_run_with_retry` (root + every subagent) retry transient failures — 429/5xx/rate-limit/socket-timeout provider errors and deepagents structured-output parse failures — with bounded retries (3 for model-call level, 1 for report-parse level). A weak-model empty-native-output 500 was observed once and is gone after the parse-level retry. Unrelated exceptions propagate to the 500 boundary immediately (the route still writes the audit row before returning 500).
+- **Tolerant report parsing (in `orchestrator_runtime.py`).** The configured free-tier model drifts from the exact report shape run to run (markdown-fenced JSON, `<subagent_report>` XML wrappers, nested `{"security_review": {"findings": [...]}}`, `violations`/`security_findings` aliases, string confidences, `location`/`risk_score`/`recommendations` synonyms). Strict `SubagentReport` validation is attempted first; `_extract_json`/`_findings_list`/`_coerce_finding`/`_coerce_report` recover the rest so per-agent `AgentExecution` rows carry real findings.
 
 **`config.py` addition:** `review_model: str` with **no default value** — force it via env var (`REVIEW_MODEL=<provider>:<model>`). It is the single model spec for the whole multi-agent system. deepagents resolves it via langchain's `init_chat_model`, which dispatches by provider prefix (`groq:`, `openrouter:`, `google_genai:`, `openai:`, `anthropic:`, `deepseek:`, `ollama:`, ...), so switching providers is a config + package + API-key change, never a code change. Do not hardcode any specific dated model snapshot in code; that just relocates the staleness problem instead of removing it. The provider's langchain integration package (see `requirements.txt`) and its API key env var (e.g. `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `GOOGLE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_HOST`) must be present — only the one matching `REVIEW_MODEL` is required.
 
@@ -278,7 +279,7 @@ class ReviewRequest(BaseModel):
     question: str | None = None       # optional — free-form question; steers any_question (available pool) AND the single-specialist question types (compliance_question / security_question / performance_question / impact_question). Ignored by review (full pipeline) and explain_question.
 ```
 
-`POST /review` returns `{"review_session_id": <int>, "result": <JSON string of the aggregated AgentOutput>}` and writes one `ReviewSession` row plus one `AgentExecution` row per routed subagent and one for the aggregator in the same Phase 1 SQLite DB.
+`POST /review` returns `{"review_session_id": <int>, "result": <JSON string of the aggregated AgentOutput>, "timeline": {<agent>: [{"kind": "llm"|"tool", "name": ..., "duration_ms": ...}, ...]}, "timeline_text": <plain-text rendering of the timeline>}` and writes one `ReviewSession` row plus one `AgentExecution` row per routed subagent and one for the aggregator in the same Phase 1 SQLite DB. The `timeline`/`timeline_text` fields are diagnostics: they let a caller see every LLM call and tool call per agent with real durations, without having to parse `logs/review_events.log`.
 
 ## Pre-Flight: Graph Readiness + Workspace Path Resolution
 
@@ -393,10 +394,11 @@ any_question:   # user-approved extension (supervisor-demo requirement)
 { type: "thinking", agent: "compliance", content: "..." }
 { type: "tool_call", agent: "compliance", tool: "query_graph_tool", input: {...} }
 { type: "tool_result", agent: "compliance", tool: "query_graph_tool", output: {...} }
+{ type: "llm_call", agent: "compliance", model: "...", duration_ms: 2796 }
 { type: "final", content: "..." }
 ```
 
-**Implemented extensions to the schema:** entries are JSON lines written to stdout (via `logging`, `EVENT <json>`) and appended to `logs/review_events.log` (file writes offloaded with `asyncio.to_thread`). Beyond the four spec events, the capture middleware adds `tool_call_attempt` (a tool call the model *emitted* — proving a `tool_call_attempt` with no matching `tool_call` means the runtime rejected it) and `invalid_tool_call` (a rejected/malformed call). Subagent-internal MCP calls are tagged with their owning agent via the `tool_scoping` wrapper. Path note: the log path is CWD-relative (`logs/review_events.log`), so it lands under the `backend/` directory when the app is launched from `backend/` (see `launch_uvicorn.cmd`).
+**Implemented extensions to the schema:** entries are JSON lines written to stdout (via `logging`, `EVENT <json>`) and appended to `logs/review_events.log` (file writes offloaded with `asyncio.to_thread`). Every event carries `ts` (epoch ms) and, where a duration is measured, `duration_ms`. Beyond the four spec events, the capture middleware adds `tool_call_attempt` (a tool call the model *emitted* — proving a `tool_call_attempt` with no matching `tool_call` means the runtime rejected it) and `invalid_tool_call` (a rejected/malformed call), and `llm_call` (each model invocation, per agent, with model id and real duration). Subagent-internal MCP calls are tagged with their owning agent via the `tool_scoping` wrapper. Path note: the log path is CWD-relative (`logs/review_events.log`), so it lands under the `backend/` directory when the app is launched from `backend/` (see `launch_uvicorn.cmd`).
 
 ---
 
@@ -519,6 +521,7 @@ class ReviewSession(SQLModel, table=True):
     repo_id: str
     graph_commit_hash: str
     request_type: str
+    model: str | None = None    # first model id seen this run (CaptureStore)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class AgentExecution(SQLModel, table=True):
@@ -527,9 +530,12 @@ class AgentExecution(SQLModel, table=True):
     agent_name: str
     duration_ms: int
     confidence: float | None = None
+    model: str | None = None    # model id that produced this agent's report
     result: str            # JSON-serialized via dataclasses.asdict() — see Agent Contracts above
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 ```
+
+**Migration note (added in the observability hardening):** `model` was added to both tables after the phase shipped. `db/engine.py` runs a guarded ALTER (adds missing columns only) in `init_db()` before `create_all`, so existing SQLite DBs upgrade in place and fresh ones are created with the columns via `create_all`.
 
 **Same fix applies to Phase 1's `RepoWorkspace`/`GraphSnapshot`/`GraphBuildStatus`** — they use the same deprecated `datetime.utcnow()` pattern. Not fixed here since it's outside this phase's scope, but worth doing before mixed naive/aware timestamps across tables in the same DB cause a real comparison bug — flag this in `OPENCODE.md` as a cross-phase cleanup item rather than leaving it unrecorded.
 

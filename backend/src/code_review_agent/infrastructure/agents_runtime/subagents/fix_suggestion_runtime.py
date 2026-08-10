@@ -13,7 +13,7 @@ async def build_fix_suggestion_spec(mcp_client, store: CaptureStore | None = Non
         "name": "fix_suggestion",
         "description": "Proposes concrete, grounded fixes for review findings (never applies them)",
         "system_prompt": load_prompt("fix_suggestion"),
-        "tools": await scope_agent_tools(mcp_client, "fix_suggestion"),
+        "tools": await scope_agent_tools(mcp_client, "fix_suggestion", store),
     }
     if store is not None:
         spec["middleware"] = [SubagentCaptureMiddleware("fix_suggestion", store)]

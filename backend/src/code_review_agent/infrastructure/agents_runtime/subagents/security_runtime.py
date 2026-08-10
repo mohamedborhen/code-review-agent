@@ -9,7 +9,7 @@ async def build_security_spec(mcp_client, store: CaptureStore | None = None) -> 
         "name": "security",
         "description": "Determines whether a change introduces a security risk",
         "system_prompt": load_prompt("security"),
-        "tools": await scope_agent_tools(mcp_client, "security"),
+        "tools": await scope_agent_tools(mcp_client, "security", store),
     }
     if store is not None:
         spec["middleware"] = [SubagentCaptureMiddleware("security", store)]

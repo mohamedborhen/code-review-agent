@@ -9,7 +9,7 @@ async def build_performance_spec(mcp_client, store: CaptureStore | None = None) 
         "name": "performance",
         "description": "Determines whether a change risks a performance regression",
         "system_prompt": load_prompt("performance"),
-        "tools": await scope_agent_tools(mcp_client, "performance"),
+        "tools": await scope_agent_tools(mcp_client, "performance", store),
     }
     if store is not None:
         spec["middleware"] = [SubagentCaptureMiddleware("performance", store)]

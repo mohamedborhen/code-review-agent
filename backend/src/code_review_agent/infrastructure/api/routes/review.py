@@ -32,10 +32,13 @@ from application.review_service.run_review import run_review
 from domain.entities.agent_finding import AgentInput, AgentOutput, ReviewResult
 from domain.review.routing_policy import agents_for_request
 from infrastructure.agents_runtime.capture import CaptureStore
+from infrastructure.agents_runtime.middleware import render_timeline
 from infrastructure.agents_runtime.orchestrator_runtime import OrchestratorRuntime
 from infrastructure.api.models import ReviewRequest
+from infrastructure.config import settings
 from infrastructure.db.engine import engine
 from infrastructure.db.models import AgentExecution, ReviewSession
+from infrastructure.event_bus.log_event_bus import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +79,14 @@ async def review(request: Request, body: ReviewRequest) -> dict:
 
     await asyncio.to_thread(_record_executions, session_id, outcome, duration_ms, orchestrator.capture)
 
+    timeline = orchestrator.capture.consume_timeline()
+    await log_event("timeline", content=render_timeline(timeline))
+
     return {
         "review_session_id": session_id,
         "result": json.dumps(dataclasses.asdict(outcome.aggregated)),
+        "timeline": timeline,
+        "timeline_text": render_timeline(timeline),
     }
 
 
@@ -88,6 +96,7 @@ def _create_review_session(body: ReviewRequest) -> int:
             repo_id=body.repo_id,
             graph_commit_hash=body.graph_commit_hash,
             request_type=body.request_type,
+            model=settings.review_model,
         )
         session.add(row)
         session.commit()
@@ -109,6 +118,7 @@ def _record_executions(
                     agent_name=per_agent.agent_name,
                     duration_ms=capture.consume_duration(per_agent.agent_name),
                     confidence=_max_confidence(per_agent),
+                    model=capture.consume_model(per_agent.agent_name) or settings.review_model,
                     result=json.dumps(dataclasses.asdict(per_agent)),
                 )
             )
@@ -118,6 +128,7 @@ def _record_executions(
                 agent_name=outcome.aggregated.agent_name,
                 duration_ms=duration_ms,
                 confidence=_max_confidence(outcome.aggregated),
+                model=capture.consume_model("orchestrator") or settings.review_model,
                 result=json.dumps(dataclasses.asdict(outcome.aggregated)),
             )
         )

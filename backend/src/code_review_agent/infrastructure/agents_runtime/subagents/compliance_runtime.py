@@ -9,7 +9,7 @@ async def build_compliance_spec(mcp_client, store: CaptureStore | None = None) -
         "name": "compliance",
         "description": "Checks a diff against team coding standards and Jira ticket scope",
         "system_prompt": load_prompt("compliance"),
-        "tools": await scope_agent_tools(mcp_client, "compliance"),
+        "tools": await scope_agent_tools(mcp_client, "compliance", store),
     }
     if store is not None:
         spec["middleware"] = [SubagentCaptureMiddleware("compliance", store)]

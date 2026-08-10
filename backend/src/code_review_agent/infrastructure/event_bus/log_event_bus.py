@@ -31,6 +31,8 @@ async def log_event(
     tool: str | None = None,
     input_: dict | None = None,
     output: object = None,
+    ts: int | None = None,
+    duration_ms: int | None = None,
 ) -> None:
     entry: dict = {"type": type_}
     if agent is not None:
@@ -43,6 +45,10 @@ async def log_event(
         entry["input"] = input_
     if output is not None:
         entry["output"] = output
+    if ts is not None:
+        entry["ts"] = ts
+    if duration_ms is not None:
+        entry["duration_ms"] = duration_ms
 
     line = json.dumps(entry, default=str)
     logger.info("EVENT %s", line)

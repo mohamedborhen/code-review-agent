@@ -27,6 +27,7 @@ class ReviewSession(SQLModel, table=True):
     repo_id: str
     graph_commit_hash: str
     request_type: str
+    model: str | None = None  # root (orchestrator+aggregator) model spec, if known
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -36,5 +37,6 @@ class AgentExecution(SQLModel, table=True):
     agent_name: str
     duration_ms: int
     confidence: float | None = None
+    model: str | None = None  # the model that actually produced this agent's output
     result: str  # JSON-serialized via dataclasses.asdict() — see PHASE_2.md Agent Contracts
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

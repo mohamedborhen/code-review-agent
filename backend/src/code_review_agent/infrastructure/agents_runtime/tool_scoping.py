@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
 
+from infrastructure.agents_runtime.capture import CaptureStore
 from infrastructure.agents_runtime.tool_descriptions import TOOL_DESCRIPTION_OVERRIDES
 from infrastructure.agents_runtime.tool_lists import AGENT_TOOL_PLAN
 from infrastructure.event_bus.log_event_bus import log_event
@@ -97,41 +98,55 @@ def _with_clean_schema(schema: Any) -> Any:
     return schema
 
 
-def _wrap_with_events(tool: BaseTool, agent_name: str) -> BaseTool:
+def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | None = None) -> BaseTool:
     """Wrap a scoped MCP tool so its call/result reach the event bus.
 
     Subagent-internal MCP calls are invisible to the orchestrator's message walk
     (deepagents nests them inside the subagent graph), so without this wrapper
     the event log cannot prove e.g. that Compliance actually called
     ``jira_get_issue`` / ``confluence_get_page``. The wrapper keeps the tool's
-    exact name/schema so the model sees no difference.
+    exact name/schema so the model sees no difference. Each executed call is
+    also timed into the shared ``CaptureStore`` so the latency timeline includes
+    per-tool durations.
     """
     if not isinstance(tool, StructuredTool):
         return tool
 
     async def _wrapped(**kwargs: object) -> object:
+        ts = int(time.time() * 1000)
         await log_event(
             "tool_call",
             agent=agent_name,
             tool=tool.name,
             input_=_truncate(str(kwargs)),
+            ts=ts,
         )
         start = time.monotonic()
         try:
             result = await tool.ainvoke(kwargs)
         except Exception as exc:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            if store is not None:
+                store.record_call(agent_name, "tool", tool.name, duration_ms)
             await log_event(
                 "tool_result",
                 agent=agent_name,
                 tool=tool.name,
                 output=f"ERROR {type(exc).__name__}: {exc}",
+                ts=ts,
+                duration_ms=duration_ms,
             )
             raise
+        duration_ms = int((time.monotonic() - start) * 1000)
+        if store is not None:
+            store.record_call(agent_name, "tool", tool.name, duration_ms)
         await log_event(
             "tool_result",
             agent=agent_name,
             tool=tool.name,
             output=_truncate(str(result)),
+            ts=ts,
+            duration_ms=duration_ms,
         )
         return _truncate_result(result)
 
@@ -145,7 +160,7 @@ def _wrap_with_events(tool: BaseTool, agent_name: str) -> BaseTool:
     )
 
 
-async def scope_agent_tools(mcp_client, agent_name: str) -> list[BaseTool]:
+async def scope_agent_tools(mcp_client, agent_name: str, store: CaptureStore | None = None) -> list[BaseTool]:
     """Fetch tools from the shared client and scope them to the agent's plan."""
     plan = AGENT_TOOL_PLAN[agent_name]
     tools: list[BaseTool] = []
@@ -154,7 +169,7 @@ async def scope_agent_tools(mcp_client, agent_name: str) -> list[BaseTool]:
             continue
         server_tools = await mcp_client.get_tools(server_name=server_name)
         if allowed is None:
-            tools.extend(_wrap_with_events(t, agent_name) for t in server_tools)
+            tools.extend(_wrap_with_events(t, agent_name, store) for t in server_tools)
             continue
-        tools.extend(_wrap_with_events(t, agent_name) for t in scoped(server_tools, allowed))
+        tools.extend(_wrap_with_events(t, agent_name, store) for t in scoped(server_tools, allowed))
     return tools

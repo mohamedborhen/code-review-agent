@@ -74,3 +74,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+from dotenv import load_dotenv
+load_dotenv(_APP_ROOT / ".env", override=False)
