@@ -37,7 +37,7 @@ Both must be up before any agent runtime work can be tested end to end.
 
 **Phase 2 code is async throughout.** `deepagents` and `langchain_mcp_adapters` are async-native; `POST /review` awaits directly rather than using `BackgroundTasks`.
 
-**One blended case:** `application/review_service/prepare_review_context.py` calls Phase 1's synchronous `graph_readiness_service` and a synchronous `RepoWorkspace` DB read, from inside Phase 2's async route. This is a deliberate, acceptable exception — a single fast SQLite read blocking briefly is fine — but it must not spread. Do not treat this as license to write other sync code in Phase 2; see `PHASE_2.md`'s note on this for the `asyncio.to_thread` alternative if strict non-blocking is preferred.
+**One blended case:** the review pre-flight (`PrepareReviewContextService` in `application/review_service/prepare_review_context.py`) runs synchronously from inside Phase 2's async route. It composes Phase 1's synchronous `GraphReadinessService` with two Layer 5 SQLModel adapters — `infrastructure/db/repo_workspace_repository.py` and `infrastructure/db/graph_status_repository.py` — all wired together by the Layer 2 route (`infrastructure/api/routes/review.py`). This is a deliberate, acceptable exception — a single fast SQLite read blocking briefly is fine — but it must not spread. Do not treat this as license to write other sync code in Phase 2; see `PHASE_2.md`'s note on this for the `asyncio.to_thread` alternative if strict non-blocking is preferred.
 
 ## Tech Stack & Tooling (cumulative across phases)
 - **Phase 1:** FastAPI, uvicorn, SQLModel + SQLite, `subprocess`+git, `mcp` SDK (`mcp>=1.27,<2`), `filelock`, `pydantic-settings`.

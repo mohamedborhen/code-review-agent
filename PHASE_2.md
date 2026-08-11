@@ -284,32 +284,46 @@ class ReviewRequest(BaseModel):
 
 ## Pre-Flight: Graph Readiness + Workspace Path Resolution
 
-Two checks that must both happen before any subagent runs, combined into one step since they're both DB lookups against Phase 1's tables:
+Two checks that must both happen before any subagent runs, combined into one use-case. The use-case depends only on two Layer 4 ports; the Layer 2 route is the composition root that wires Phase 1's `GraphReadinessService` and two Layer 5 SQLModel adapters into it:
 
 ```python
-# application/review_service/prepare_review_context.py
-import asyncio
-from fastapi import HTTPException
+# domain/review/review_context_ports.py  (Layer 4, plain Protocol — no framework, no SQL)
+class RepoWorkspaceQueryPort(Protocol):
+    def get_by_repo_id(self, repo_id: str) -> RepoWorkspace | None: ...
 
-def prepare_review_context(repo_id: str, graph_commit_hash: str) -> str:
-    """Returns repo_root (local_path). Raises HTTPException if not ready."""
-    workspace = get_repo_workspace(repo_id)  # query RepoWorkspace — 404 if repo_id unknown
-    if workspace is None:
-        raise HTTPException(status_code=404, detail=f"Unknown repo_id: {repo_id}")
+class GraphReadinessPort(Protocol):
+    def is_ready(self, repo_id: str, commit_hash: str) -> bool: ...
 
-    if not graph_readiness_service.is_ready(repo_id, graph_commit_hash):  # Phase 1's service, sync
-        raise HTTPException(status_code=425, detail="Graph not ready for this commit yet")
+# application/review_service/prepare_review_context.py  (Layer 3, pure use-case)
+class PrepareReviewContextService:
+    def __init__(self, workspace_query: RepoWorkspaceQueryPort, readiness: GraphReadinessPort) -> None: ...
 
-    return workspace.local_path
+    def execute(self, repo_id: str, graph_commit_hash: str) -> str:
+        """Returns repo_root (local_path). Raises RepoNotFoundError / GraphNotReadyError."""
+        workspace = self._workspace_query.get_by_repo_id(repo_id)  # None -> RepoNotFoundError (404)
+        if workspace is None:
+            raise RepoNotFoundError(repo_id)
+        if not self._readiness.is_ready(repo_id, graph_commit_hash):  # Phase 1's service, sync
+            raise GraphNotReadyError(repo_id, graph_commit_hash)      # -> 425
+        return workspace.local_path
+
+# infrastructure/api/routes/review.py  (Layer 2 composition root)
+_prepare_context = PrepareReviewContextService(
+    SQLModelRepoWorkspaceRepository(),                # infra/db/repo_workspace_repository.py
+    GraphReadinessService(SQLModelGraphStatusQuery()), # infra/db/graph_status_repository.py
+)
+# repo_root = _prepare_context.execute(body.repo_id, body.graph_commit_hash)
+#   RepoNotFoundError   -> HTTPException(404, f"Unknown repo_id: {repo_id}")
+#   GraphNotReadyError  -> HTTPException(425, "Graph not ready for this commit yet")
 ```
 
 **Why this matters, concretely:**
 - **`local_path` comes from the DB, never from a guessed or LLM-supplied path** — this is what every subagent's `repo_root` argument to CRG tools is actually resolved from. Nothing constructs a filesystem path from `repo_id` directly.
 - **425, not a silent wait or a stale query** — if the graph isn't ready for this exact commit, subagents must not run against a graph that's mid-update or doesn't exist yet.
 
-**Async note:** `graph_readiness_service` and the `RepoWorkspace` lookup are Phase 1 code — synchronous, by Phase 1's own design. Calling a sync DB read directly inside this phase's `async def` route would block the event loop for its duration. For a single fast SQLite read this is a minor, acceptable exception in practice — but if you want to keep the async layer strictly non-blocking, wrap the call: `await asyncio.to_thread(prepare_review_context, repo_id, graph_commit_hash)` from the route handler. Either is acceptable; pick one and be consistent, don't mix.
+**Async note:** `GraphReadinessService` and the `RepoWorkspace` lookup are Phase 1 code — synchronous, by Phase 1's own design. Calling a sync DB read directly inside this phase's `async def` route would block the event loop for its duration. For a single fast SQLite read this is a minor, acceptable exception in practice — but if you want to keep the async layer strictly non-blocking, wrap the call: `repo_root = await asyncio.to_thread(_prepare_context.execute, body.repo_id, body.graph_commit_hash)` from the route handler. Either is acceptable; pick one and be consistent, don't mix.
 
-**Implementation note:** Phase 1 defines `GraphReadinessService` but never instantiates it, so `prepare_review_context.py` constructs it with a local `_GraphSnapshotStatusQueryPort` shim (a direct `GraphSnapshot` query, the same query the webhook flow uses). The `RepoWorkspace` lookup is likewise a direct `select(RepoWorkspace)...` against the Phase 1 table.
+**Implementation note:** the use-case (`PrepareReviewContextService`) is pure Layer 3 — no FastAPI, no SQLModel, no `infrastructure` imports. Its two ports are declared in `domain/review/review_context_ports.py` and implemented by `infrastructure/db/repo_workspace_repository.py` (the `select(RepoWorkspace)...` query the webhook flow uses) and `infrastructure/db/graph_status_repository.py` (a direct `GraphSnapshot` query returning a `GraphBuildStatus` entity). Phase 1 defines `GraphReadinessService` but never instantiates it, so the Layer 2 route composes it with the latter adapter. The route translates the use-case's application-layer exceptions (`RepoNotFoundError` → 404, `GraphNotReadyError` → 425) into HTTP status codes.
 
 ## Agent Contracts
 
@@ -323,7 +337,7 @@ class AgentInput:
     graph_commit_hash: str
     request_type: str
     diff_content: str | None = None
-    repo_root: str = ""          # DB-resolved local_path from prepare_review_context
+    repo_root: str = ""          # DB-resolved local_path from PrepareReviewContextService
     question: str | None = None  # free-form question for any_question; also forwarded for compliance/security/performance/impact question types
 
 @dataclass
@@ -418,6 +432,7 @@ backend/src/code_review_agent/
 │   ├── graph/
 │   │   └── graph_builder_port.py              # (Phase 1, unchanged)
 │   └── review/                                 # NEW
+│       ├── review_context_ports.py              # NEW — RepoWorkspaceQueryPort + GraphReadinessPort (Protocols)
 │       ├── review_orchestrator_port.py         # NEW — async def run_review(...)
 │       └── routing_policy.py                   # NEW — plain Python/YAML-loader, no framework import
 │
@@ -425,7 +440,8 @@ backend/src/code_review_agent/
 │   ├── repo_ingestion_service/                 # (Phase 1, unchanged)
 │   ├── graph_build_service/                    # (Phase 1, unchanged)
 │   └── review_service/                         # NEW
-│       ├── prepare_review_context.py           # NEW — readiness check (425) + local_path resolution from DB
+│       ├── prepare_review_context.py           # NEW — pure use-case (no framework/SQL): readiness check (425) + local_path resolution from DB via injected ports
+│       ├── errors.py                           # NEW — RepoNotFoundError, GraphNotReadyError, UnknownRequestTypeError (app-layer, no FastAPI)
 │       └── run_review.py                       # routes via routing_policy -> invokes ReviewOrchestratorPort
 │
 ├── infrastructure/                             # existing from Phase 1, extended
@@ -436,7 +452,9 @@ backend/src/code_review_agent/
 │   ├── workspace/                              # (Phase 1, unchanged)
 │   ├── db/
 │   │   ├── models.py                           # (Phase 1 tables unchanged) + NEW ReviewSession, AgentExecution
-│   │   └── engine.py                           # (Phase 1, EXTENDED — WAL pragma added, see SQLite note below)
+│   │   ├── engine.py                           # (Phase 1, EXTENDED — WAL pragma added, see SQLite note below)
+│   │   ├── repo_workspace_repository.py        # NEW — SQLModelRepoWorkspaceRepository, implements RepoWorkspaceQueryPort
+│   │   └── graph_status_repository.py          # NEW — SQLModelGraphStatusQuery, feeds GraphReadinessService
 │   ├── mcp_clients/                            # NEW
 │   │   └── mcp_client_factory.py               # builds the shared MultiServerMCPClient
 │   ├── agents_runtime/                         # NEW
@@ -467,7 +485,7 @@ backend/src/code_review_agent/
 │       ├── models.py                           # NEW — ReviewRequest (Pydantic), Layer 2, not domain
 │       └── routes/
 │           ├── webhooks.py                     # (Phase 1, unchanged)
-│           └── review.py                       # NEW — POST /review; calls prepare_review_context first, then dispatches agents
+│           └── review.py                       # NEW — POST /review; runs the pre-flight service (404/425) first, then dispatches agents
 │
 ├── scripts/
 │   ├── run_crg_server.sh                       # (Phase 1, unchanged)
@@ -582,8 +600,8 @@ Items below are marked against the *implemented* state (verified in code and liv
 - [x] Each GitHub-using agent's `allowed_names` set was checked against the live GitHub MCP tool registry (e.g. via `mcpcurl tools --help`) before implementation, not copied from this doc unverified — verified names recorded in `tool_lists.py`.
 - [x] Routing Policy includes `performance` in the `review` entry, the single-specialist types `security_question`/`compliance_question`/`performance_question`/`impact_question` (one specialist each), `explain_question` (direct answer), and the user-approved `any_question` extension (available-pool semantics; unknown request types → `None` → 400).
 - [x] `POST /review` validates its body against `ReviewRequest` (Pydantic, in `infrastructure/api/models.py` — not `domain/`), including the optional `question` field.
-- [x] `POST /review` calls `prepare_review_context` before dispatching any agent: returns 404 for an unknown `repo_id`, returns 425 if the graph isn't ready for `graph_commit_hash` — verified by testing both failure cases, not just the happy path.
-- [x] Every subagent's `repo_root`/CRG tool calls use the `local_path` resolved from `RepoWorkspace` via `prepare_review_context` — never a guessed or independently-constructed filesystem path. The orchestrator's user message hands every `task` call BOTH `owner`/`repo` (GitHub tools) AND `repo_root` (CRG tools).
+- [x] `POST /review` runs the pre-flight service (`PrepareReviewContextService.execute`) before dispatching any agent: returns 404 for an unknown `repo_id`, returns 425 if the graph isn't ready for `graph_commit_hash` — verified by testing both failure cases, not just the happy path.
+- [x] Every subagent's `repo_root`/CRG tool calls use the `local_path` resolved from `RepoWorkspace` via the pre-flight service — never a guessed or independently-constructed filesystem path. The orchestrator's user message hands every `task` call BOTH `owner`/`repo` (GitHub tools) AND `repo_root` (CRG tools).
 - [x] `POST /review` runs orchestrator → subagents (per routing policy) → aggregator, returns `{"review_session_id": <int>, "result": <aggregated AgentOutput JSON>, "timeline": <per-agent llm/tool call log>, "timeline_text": <plain-text rendering>}`.
 - [x] `MultiServerMCPClient` is constructed once at FastAPI startup (lifespan), not per-request.
 - [x] Phase 2's new tables (`ReviewSession`, `AgentExecution`) actually exist at runtime — satisfied by Phase 1's existing `init_db()`/`create_all` wiring once they were added to `db/models.py`, not by new startup code.

@@ -2,9 +2,9 @@
 
 Flow (order is load-bearing, see PHASE_2.md DoD):
 1. Validate request_type against the Routing Policy (400 on unknown).
-2. prepare_review_context (404 unknown repo_id, 425 graph not ready) — BEFORE
-   any agent runs, and the resolved repo_root comes from the RepoWorkspace DB
-   row, never from a guessed path.
+2. PrepareReviewContextService (404 unknown repo_id, 425 graph not ready) —
+   BEFORE any agent runs, and the resolved repo_root comes from the
+   RepoWorkspace DB row, never from a guessed path.
 3. Create the ReviewSession audit row.
 4. Run orchestrator -> subagents -> aggregator via run_review (Application
    layer) against the shared MultiServerMCPClient from app.state.
@@ -14,8 +14,8 @@ Flow (order is load-bearing, see PHASE_2.md DoD):
    AgentExecution error row before the 500 is returned.
 
 Phase 2 is async throughout: DB writes are wrapped in asyncio.to_thread so the
-event loop is never blocked. prepare_review_context is the documented blessed
-sync exception (see AGENTS.md).
+event loop is never blocked. PrepareReviewContextService is the documented
+blessed sync exception (see AGENTS.md).
 """
 
 import asyncio
@@ -27,7 +27,13 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from sqlmodel import Session
 
-from application.review_service.prepare_review_context import prepare_review_context
+from application.graph_build_service.graph_readiness_service import GraphReadinessService
+from application.review_service.errors import (
+    GraphNotReadyError,
+    RepoNotFoundError,
+    UnknownRequestTypeError,
+)
+from application.review_service.prepare_review_context import PrepareReviewContextService
 from application.review_service.run_review import run_review
 from domain.entities.agent_finding import AgentInput, AgentOutput, ReviewResult
 from domain.review.routing_policy import agents_for_request
@@ -37,12 +43,22 @@ from infrastructure.agents_runtime.orchestrator_runtime import OrchestratorRunti
 from infrastructure.api.models import ReviewRequest
 from infrastructure.config import settings
 from infrastructure.db.engine import engine
+from infrastructure.db.graph_status_repository import SQLModelGraphStatusQuery
 from infrastructure.db.models import AgentExecution, ReviewSession
+from infrastructure.db.repo_workspace_repository import SQLModelRepoWorkspaceRepository
 from infrastructure.event_bus.log_event_bus import log_event
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Layer 2 is the composition root: the route wires the (stateless) DB adapters
+# into Phase 1's GraphReadinessService and the review pre-flight use-case. Each
+# call opens its own Session, so a module-level instance is safe.
+_prepare_context = PrepareReviewContextService(
+    SQLModelRepoWorkspaceRepository(),
+    GraphReadinessService(SQLModelGraphStatusQuery()),
+)
 
 
 @router.post("/review")
@@ -50,7 +66,12 @@ async def review(request: Request, body: ReviewRequest) -> dict:
     if agents_for_request(body.request_type) is None:
         raise HTTPException(status_code=400, detail=f"Unknown request_type: {body.request_type}")
 
-    repo_root = prepare_review_context(body.repo_id, body.graph_commit_hash)
+    try:
+        repo_root = _prepare_context.execute(body.repo_id, body.graph_commit_hash)
+    except RepoNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GraphNotReadyError as exc:
+        raise HTTPException(status_code=425, detail="Graph not ready for this commit yet") from exc
 
     session_id = await asyncio.to_thread(_create_review_session, body)
 
@@ -70,6 +91,8 @@ async def review(request: Request, body: ReviewRequest) -> dict:
         outcome = await run_review(review_input, orchestrator)
     except HTTPException:
         raise
+    except UnknownRequestTypeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         await asyncio.to_thread(_record_error_execution, session_id, exc)
         logger.error("Review failed for session %s: %s", session_id, exc)
