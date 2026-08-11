@@ -13,18 +13,21 @@ body = {
     "fields": {
         "project": {"key": "CLIP"},
         "issuetype": {"id": "10042"},
-        "summary": "Add PDF path validation to vector.py",
+        "summary": "Extract duplicated traffic-light grade computation in scoring router",
         "description": {
             "type": "doc",
             "version": 1,
             "content": [
-                para("Scope: vector.py only. Add a validate_pdf_path() function that checks the path "
-                     "exists and ends in .pdf before build_retriever loads it. Do not modify app.py."),
+                para("Scope: backend/routers/scoring.py only. Extract the traffic-light grade "
+                     "computation (cnss_grade / op_grade) currently duplicated inside "
+                     "predict_score and what_if_simulation into a shared helper "
+                     "_compute_grades(cnss_ratio, op_avg) -> (cnss_grade, op_grade). "),
                 para("Acceptance criteria:"),
                 {"type": "bulletList", "content": [
-                    {"type": "listItem", "content": [para("snake_case names")]},
-                    {"type": "listItem", "content": [para("every function <= 50 lines")]},
-                    {"type": "listItem", "content": [para("no print() debug statements in committed code")]},
+                    {"type": "listItem", "content": [para("new helper _compute_grades added; both endpoints call it")]},
+                    {"type": "listItem", "content": [para("identical behavior: thresholds stay cnss > 0.8, cnss >= 0.5, op_avg >= 8, op_avg >= 5")]},
+                    {"type": "listItem", "content": [para("helper is snake_case and <= 20 lines")]},
+                    {"type": "listItem", "content": [para("no changes to any other file")]},
                 ]},
             ],
         },

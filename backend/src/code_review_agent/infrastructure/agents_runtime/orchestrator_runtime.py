@@ -282,7 +282,7 @@ def _extract_json(text: str) -> str:
     """Pull a JSON block out of a fenced/prose subagent reply.
 
     Subagents regularly wrap their JSON report in a markdown code fence
-    (``**SubagentReport**\\n\\n```json ... `````) or an XML-style tag
+    (``**SubagentReport**\n\n```json ... `````) or an XML-style tag
     (``<subagent_report> ... </subagent_report>``), which makes ``json.loads``
     fail and silently empties their AgentExecution row. Strip the wrapper before
     parsing so the strict path still gets first crack at the real JSON.

@@ -30,9 +30,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelResponse
 from langchain_core.messages import AIMessage
 
-from deepagents._models import get_model_identifier
-
-from infrastructure.agents_runtime.capture import CaptureStore
+from infrastructure.agents_runtime.capture import CaptureStore, canonical_model_label
 from infrastructure.event_bus.log_event_bus import _append_to_file, log_event
 
 logger = logging.getLogger(__name__)
@@ -60,17 +58,6 @@ def _is_transient_provider_error(exc: Exception) -> bool:
     retrying would just burn quota.
     """
     return bool(_TRANSIENT_PROVIDER_PATTERN.search(str(exc)))
-
-
-def _model_label(model: object) -> str:
-    """Best-effort model identifier for event/timeline labelling."""
-    try:
-        identifier = get_model_identifier(model)  # type: ignore[arg-type]
-        if identifier:
-            return str(identifier)
-    except Exception:  # noqa: BLE001 - best-effort labelling must never break a review
-        pass
-    return str(getattr(model, "model_id", None) or "unknown")
 
 
 class TransientRetryMiddleware(AgentMiddleware):
@@ -136,9 +123,9 @@ class RootTimingMiddleware(AgentMiddleware):
         start = time.monotonic()
         response = handler(request)
         duration_ms = int((time.monotonic() - start) * 1000)
-        self._record(_model_label(request.model), duration_ms)
+        self._record(canonical_model_label(request.model), duration_ms)
         line = json.dumps(
-            {"type": "llm_call", "agent": "orchestrator", "content": _model_label(request.model), "duration_ms": duration_ms},
+            {"type": "llm_call", "agent": "orchestrator", "content": canonical_model_label(request.model), "duration_ms": duration_ms},
             default=str,
         )
         logger.info("EVENT %s", line)
@@ -149,7 +136,7 @@ class RootTimingMiddleware(AgentMiddleware):
         start = time.monotonic()
         response = await handler(request)
         duration_ms = int((time.monotonic() - start) * 1000)
-        model = _model_label(request.model)
+        model = canonical_model_label(request.model)
         self._record(model, duration_ms)
         await log_event("llm_call", agent="orchestrator", content=model, duration_ms=duration_ms)
         return response

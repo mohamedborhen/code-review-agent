@@ -9,3 +9,8 @@ scripts/test_crg_mcp.py
 ngrok.exe
 .ngrok.exe.old
 inspect_db.py
+# Added by code-review-graph
+.code-review-graph/
+.vscode/
+.github/
+.opencode/

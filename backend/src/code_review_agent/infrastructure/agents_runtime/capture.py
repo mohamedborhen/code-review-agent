@@ -30,8 +30,9 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
-from deepagents._models import get_model_identifier
+from deepagents._models import get_model_identifier, model_matches_spec
 
+from infrastructure.config import settings
 from infrastructure.event_bus.log_event_bus import _append_to_file, log_event
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,26 @@ def _model_label(model: object) -> str:
     except Exception:  # noqa: BLE001 - best-effort labelling must never break a review
         pass
     return str(getattr(model, "model_id", None) or "unknown")
+
+
+def canonical_model_label(model: object) -> str:
+    """Canonical model spec shared by every audit location.
+
+    ``_model_label`` returns the provider-native identifier (e.g.
+    ``nvidia/nemotron-...``), dropping the ``provider:`` prefix, so
+    ``ReviewSession.model`` (the full ``settings.review_model`` spec) and
+    ``AgentExecution.model`` (the captured label) disagreed. When the model
+    instance matches ``settings.review_model`` (``model_matches_spec``
+    normalizes provider spelling/case), return the canonical full spec
+    verbatim; otherwise fall back to ``_model_label`` so future per-agent
+    models still get a best-effort label.
+    """
+    try:
+        if model_matches_spec(model, settings.review_model):  # type: ignore[arg-type]
+            return settings.review_model
+    except Exception:  # noqa: BLE001 - best-effort labelling must never break a review
+        pass
+    return _model_label(model)
 
 
 class CaptureStore:
@@ -142,7 +163,7 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         return response
 
     def _record_call(self, request: Any, duration_ms: int) -> None:
-        model = _model_label(getattr(request, "model", None))
+        model = canonical_model_label(getattr(request, "model", None))
         self._store.record_call(self._agent_name, "llm", model, duration_ms)
         self._store.record_model(self._agent_name, model)
         line = json.dumps(
@@ -153,7 +174,7 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         _append_to_file(line)
 
     async def _arecord_call(self, request: Any, duration_ms: int) -> None:
-        model = _model_label(getattr(request, "model", None))
+        model = canonical_model_label(getattr(request, "model", None))
         self._store.record_call(self._agent_name, "llm", model, duration_ms)
         self._store.record_model(self._agent_name, model)
         await log_event("llm_call", agent=self._agent_name, content=model, duration_ms=duration_ms)

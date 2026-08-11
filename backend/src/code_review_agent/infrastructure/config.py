@@ -1,15 +1,29 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import ConfigDict, model_validator
 from pydantic_settings import BaseSettings
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _resolve_env_file() -> Path:
+    module_path = Path(__file__).resolve()
+    for candidate in [module_path.parent, *module_path.parents, Path.cwd()]:
+        env_file = candidate / ".env"
+        if env_file.is_file():
+            return env_file
+    return Path.cwd() / ".env"
+
+
+_ENV_FILE = _resolve_env_file()
+load_dotenv(_ENV_FILE, override=False)
+
+
 class Settings(BaseSettings):
     model_config = ConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         # `.env` also carries keys owned by other processes, not our Settings:
         # LLM provider keys (read by init_chat_model from os.environ) and the
         # mcp-atlassian server vars (READ_ONLY_MODE / ALLOW_GLOBAL_CRED_FALLBACK /
@@ -38,7 +52,7 @@ class Settings(BaseSettings):
     # "unset" to the model's full output window (16k for gpt-4o-mini), which the
     # OpenRouter free tier rejects ("...can only afford 15683"). Config-driven so
     # it is not a hardcoded value and can be raised when credits permit.
-    review_max_tokens: int = 2000
+    review_max_tokens: int = 8192
     # Per-model-call timeout in seconds, forwarded to the provider as `timeout`.
     # Free-tier hosts (e.g. NVIDIA NIM) can exceed the previous hardcoded 240s on
     # a single long-reasoning turn, which surfaced as "Timeout on reading data
@@ -71,9 +85,6 @@ class Settings(BaseSettings):
         if not os.path.isabs(self.metadata_db_path):
             self.metadata_db_path = str(_APP_ROOT / self.metadata_db_path)
         return self
-
-
 settings = Settings()
 
-from dotenv import load_dotenv
-load_dotenv(_APP_ROOT / ".env", override=False)
+
