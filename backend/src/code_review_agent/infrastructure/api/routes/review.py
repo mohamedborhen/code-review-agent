@@ -23,6 +23,7 @@ import dataclasses
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlmodel import Session
@@ -120,6 +121,8 @@ def _create_review_session(body: ReviewRequest) -> int:
             graph_commit_hash=body.graph_commit_hash,
             request_type=body.request_type,
             model=settings.review_model,
+            status="running",
+            expected_agents=json.dumps(agents_for_request(body.request_type) or []),
         )
         session.add(row)
         session.commit()
@@ -134,6 +137,14 @@ def _record_executions(
     capture: CaptureStore,
 ) -> None:
     with Session(engine) as session:
+        review_session = session.get(ReviewSession, session_id)
+        if review_session is not None:
+            review_session.status = "completed"
+            review_session.duration_ms = duration_ms
+            review_session.completed_at = datetime.now(timezone.utc)
+            review_session.dispatched_agents = json.dumps(
+                [per_agent.agent_name for per_agent in outcome.per_agent]
+            )
         for per_agent in outcome.per_agent:
             session.add(
                 AgentExecution(
@@ -160,6 +171,10 @@ def _record_executions(
 
 def _record_error_execution(session_id: int, exc: Exception) -> None:
     with Session(engine) as session:
+        review_session = session.get(ReviewSession, session_id)
+        if review_session is not None:
+            review_session.status = "failed"
+            review_session.error = str(exc)
         session.add(
             AgentExecution(
                 review_session_id=session_id,

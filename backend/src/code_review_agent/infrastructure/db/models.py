@@ -29,6 +29,18 @@ class ReviewSession(SQLModel, table=True):
     request_type: str
     model: str | None = None  # root (orchestrator+aggregator) model spec, if known
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # --- lifecycle / audit (added in the session-lifecycle workstream) ---
+    # status: "running" on creation, "completed" on success, "failed" on a
+    # caught exception. Legacy rows created before this column existed stay NULL.
+    status: str | None = None
+    error: str | None = None  # exception text when status == "failed"
+    duration_ms: int | None = None  # whole run_review wall time on success
+    completed_at: datetime | None = None
+    # JSON lists — what the routing policy required vs. which subagents actually
+    # dispatched (from the parsed per-agent reports). Enables over-delegation
+    # auditing from the DB without relying on the ephemeral event log.
+    expected_agents: str | None = None
+    dispatched_agents: str | None = None
 
 
 class AgentExecution(SQLModel, table=True):

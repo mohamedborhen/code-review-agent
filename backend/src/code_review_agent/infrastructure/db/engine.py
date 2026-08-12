@@ -31,7 +31,20 @@ def _add_model_columns() -> None:
     is additive, and it introduces no new dependency (see OPENCODE.md).
     """
     with engine.begin() as conn:
-        for table, column in (("reviewsession", "model"), ("agentexecution", "model")):
+        column_defs = [
+            ("reviewsession", "model", "TEXT"),
+            ("agentexecution", "model", "TEXT"),
+            # session lifecycle / audit (see db/models.py ReviewSession)
+            ("reviewsession", "status", "TEXT"),
+            ("reviewsession", "error", "TEXT"),
+            ("reviewsession", "duration_ms", "INTEGER"),
+            ("reviewsession", "completed_at", "DATETIME"),
+            ("reviewsession", "expected_agents", "TEXT"),
+            ("reviewsession", "dispatched_agents", "TEXT"),
+        ]
+        for table, column, sql_type in column_defs:
             cols = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
             if column not in cols:
-                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+                )
