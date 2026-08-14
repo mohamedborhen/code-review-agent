@@ -36,6 +36,7 @@ from infrastructure.agents_runtime.middleware import (
     TransientRetryMiddleware,
     _is_transient_provider_error,
 )
+from infrastructure.agents_runtime.report_parse import extract_json_text as _extract_json
 from infrastructure.agents_runtime.report_schema import FindingItem, SubagentReport
 from infrastructure.agents_runtime.subagents.compliance_runtime import build_compliance_spec
 from infrastructure.agents_runtime.subagents.fix_suggestion_runtime import build_fix_suggestion_spec
@@ -133,7 +134,7 @@ class OrchestratorRuntime:
 
         return ReviewResult(
             aggregated=_parse_aggregated(result),
-            per_agent=_extract_per_agent(messages),
+            per_agent=_extract_per_agent(messages, self.capture),
         )
 
 
@@ -284,27 +285,6 @@ def _parse_aggregated_from_messages(result: dict) -> AgentOutput | None:
         except Exception:
             continue
     return None
-
-
-def _extract_json(text: str) -> str:
-    """Pull a JSON block out of a fenced/prose subagent reply.
-
-    Subagents regularly wrap their JSON report in a markdown code fence
-    (``**SubagentReport**\n\n```json ... `````) or an XML-style tag
-    (``<subagent_report> ... </subagent_report>``), which makes ``json.loads``
-    fail and silently empties their AgentExecution row. Strip the wrapper before
-    parsing so the strict path still gets first crack at the real JSON.
-    """
-    match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    match = re.search(
-        r"<(?:subagent_report|report|result)\b[^>]*>(.*?)"
-        r"</(?:subagent_report|report|result)>",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    return match.group(1).strip() if match else text
 
 
 def _parse_tool_message(agent_name: str, content) -> AgentOutput:
@@ -478,7 +458,24 @@ def _coerce_report(text: str, agent_name: str) -> SubagentReport:
     )
 
 
-def _extract_per_agent(messages) -> list[AgentOutput]:
+def _looks_like_json_obj(content) -> bool:
+    """True when the final ToolMessage content is at least a JSON object.
+
+    A valid JSON object — even ``{"agent_name": ..., "findings": []}`` — is a
+    genuine subagent verdict and must NOT be overwritten by the stashed-report
+    recovery. Only prose/empty/garbage content (json.loads fails) qualifies for
+    recovery.
+    """
+    if not content:
+        return False
+    text = content.content if hasattr(content, "content") else str(content)
+    try:
+        return isinstance(json.loads(_extract_json(text)), dict)
+    except (TypeError, ValueError):
+        return False
+
+
+def _extract_per_agent(messages, capture: CaptureStore) -> list[AgentOutput]:
     task_calls = _index_task_calls(messages)
     outputs: list[AgentOutput] = []
     for msg in messages:
@@ -487,7 +484,24 @@ def _extract_per_agent(messages) -> list[AgentOutput]:
         agent_name = task_calls.get(msg.tool_call_id)
         if agent_name is None:
             continue
-        outputs.append(_parse_tool_message(agent_name, msg.content))
+        output = _parse_tool_message(agent_name, msg.content)
+        if output.findings:
+            outputs.append(output)
+            continue
+        if _looks_like_json_obj(msg.content):
+            outputs.append(output)
+            continue
+        # Final message was prose/empty — the model likely emitted its real
+        # report in an earlier message that the middleware stashed. Recover it.
+        stashed = capture.consume_report(agent_name)
+        if stashed is not None:
+            try:
+                report = _coerce_report(json.dumps(stashed), agent_name)
+                outputs.append(_to_agent_output(report))
+                continue
+            except Exception:
+                logger.warning("Could not coerce stashed report for %s", agent_name)
+        outputs.append(output)
     return outputs
 
 

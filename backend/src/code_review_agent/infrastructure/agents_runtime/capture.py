@@ -32,6 +32,7 @@ from langchain_core.messages import AIMessage
 
 from deepagents._models import get_model_identifier, model_matches_spec
 
+from infrastructure.agents_runtime.report_parse import report_dict_from_text
 from infrastructure.config import settings
 from infrastructure.event_bus.log_event_bus import _append_to_file, log_event
 
@@ -82,6 +83,10 @@ class CaptureStore:
         self._durations: dict[str, list[int]] = {}
         self._models: dict[str, str] = {}
         self._timeline: dict[str, list[dict]] = {}
+        # Last report-shaped JSON dict emitted by each subagent, per invocation.
+        # FIFO list so a re-dispatched agent (LLM-driven 2x delegation) pairs
+        # each task ToolMessage with its own run's report in order.
+        self._reports: dict[str, list[dict]] = {}
 
     def record_duration(self, agent_name: str, duration_ms: int) -> None:
         self._durations.setdefault(agent_name, []).append(duration_ms)
@@ -107,6 +112,15 @@ class CaptureStore:
         timeline = self._timeline
         self._timeline = {}
         return timeline
+
+    def record_report(self, agent_name: str, report: dict) -> None:
+        self._reports.setdefault(agent_name, []).append(report)
+
+    def consume_report(self, agent_name: str) -> dict | None:
+        pending = self._reports.get(agent_name)
+        if not pending:
+            return None
+        return pending.pop(0)
 
 
 class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -142,6 +156,7 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         start = time.monotonic()
         response = handler(request)
         self._record_call(request, int((time.monotonic() - start) * 1000))
+        self._stash_reports(response)
         for entry in self._build_entries(response):
             line = json.dumps(entry, default=str)
             logger.info("EVENT %s", line)
@@ -152,6 +167,7 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         start = time.monotonic()
         response = await handler(request)
         await self._arecord_call(request, int((time.monotonic() - start) * 1000))
+        self._stash_reports(response)
         for entry in self._build_entries(response):
             await log_event(
                 entry["type"],
@@ -161,6 +177,29 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
                 input_=entry.get("input"),
             )
         return response
+
+    def _stash_reports(self, response: Any) -> None:
+        """Stash the last report-shaped JSON each subagent emitted.
+
+        A weak model sometimes produces its real SubagentReport JSON in an
+        earlier message and then closes the run with prose or an empty message;
+        the final ``task`` ToolMessage (what ``_extract_per_agent`` parses) is
+        then not parseable and the findings would be lost. Every AIMessage the
+        model emits passes through here (this middleware wraps the model call),
+        so the last report-shaped dict is stashed per invocation for recovery.
+        """
+        if hasattr(response, "result"):
+            messages = response.result
+        elif isinstance(response, AIMessage):
+            messages = [response]
+        else:
+            messages = []
+        for msg in messages:
+            if not isinstance(msg, AIMessage):
+                continue
+            report = report_dict_from_text(str(msg.content or ""))
+            if report is not None:
+                self._store.record_report(self._agent_name, report)
 
     def _record_call(self, request: Any, duration_ms: int) -> None:
         model = canonical_model_label(getattr(request, "model", None))
