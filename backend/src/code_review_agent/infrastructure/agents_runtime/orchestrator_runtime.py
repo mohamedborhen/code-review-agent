@@ -59,12 +59,13 @@ _SUBAGENT_BUILDERS = {
 _ALL_SUBAGENTS = list(_SUBAGENT_BUILDERS)
 
 # Typed request types that carry an optional user question: the single-
-# specialist questions (compliance/security/performance/impact) now forward the
+# specialist questions (compliance/security/performance/impact) forward the
 # `question` field so the user can steer the specialist (e.g. a ticket key to
-# check). `review` (full pipeline) and `explain_question` (direct answer) are
-# intentionally not included; use `any_question` for free-form steering there.
+# check). `review` (full pipeline) forwards it too so users can give the
+# orchestrator both the diff and a linked Jira ticket key in one prompt.
+# `explain_question` (direct answer) stays without one.
 _QUESTION_CARRYING_TYPES = frozenset(
-    {"compliance_question", "security_question", "performance_question", "impact_question"}
+    {"review", "compliance_question", "security_question", "performance_question", "impact_question"}
 )
 
 
@@ -182,12 +183,19 @@ def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str
                 review_input.question,
             ]
         )
+    diff_instructions = (
+        "The complete, unmodified diff for this review is appended automatically to every "
+        "task description by the system — you must not reproduce, summarize, abbreviate, "
+        "or reference the diff text yourself."
+        if review_input.diff_content
+        else "There is no separate diff parameter for this review: any diff content the user "
+        "supplied lives inside the 'Question from the user:' section above. Forward that "
+        "question verbatim into every task description so subagents see the exact diff."
+    )
     lines.extend(
         [
             "",
-            "The complete, unmodified diff for this review is appended automatically to every "
-            "task description by the system — you must not reproduce, summarize, abbreviate, "
-            "or reference the diff text yourself.",
+            diff_instructions,
             "",
             "Classify the request, delegate to every required subagent, then synthesize all "
             "reports into a single SubagentReport JSON.",
