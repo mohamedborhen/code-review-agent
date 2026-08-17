@@ -72,6 +72,8 @@ _prepare_context = PrepareReviewContextService(
     GraphReadinessService(SQLModelGraphStatusQuery()),
 )
 
+_repo_store = SQLModelRepoWorkspaceRepository()
+
 _ensure_worktree = EnsureBranchWorktreeService(
     GitRepoSource(),
     CRGMcpAdapter(settings.crg_server_url),
@@ -122,6 +124,15 @@ async def review(
         response.background = background_tasks
         return response
 
+    # Success path — refresh the eviction LRU recency signal (§11). Touched
+    # here (not in the pre-flight use-case, which stays pure/side-effect-free).
+    # The base-clone row's recency is kept fresh by webhook syncs' updated_at,
+    # so only the per-branch rows need an explicit touch on access.
+    if body.branch is not None:
+        await asyncio.to_thread(
+            _touch_recency, _repo_store, body.repo_id, body.branch
+        )
+
     session_id = await asyncio.to_thread(_create_review_session, body, resolved_commit)
 
     review_input = AgentInput(
@@ -169,6 +180,19 @@ def _validate_branch_or_hash(body: ReviewRequest) -> None:
             status_code=400,
             detail="Provide exactly one of 'branch' or 'graph_commit_hash'",
         )
+
+
+def _touch_recency(repo_store, repo_id: str, branch: str) -> None:
+    """Best-effort LRU recency touch (§11) — must never fail the review flow.
+
+    This is non-load-bearing bookkeeping: a failure (e.g. SQLite locked past
+    busy_timeout) is logged and swallowed so the review still proceeds and
+    writes its audit rows.
+    """
+    try:
+        repo_store.touch_requested_at(repo_id, branch)
+    except Exception as exc:  # noqa: BLE001 — bookkeeping, not load-bearing
+        logger.warning("recency touch failed for %s@%s: %s", repo_id, branch, exc)
 
 
 def _create_review_session(body: ReviewRequest, resolved_commit: str) -> int:

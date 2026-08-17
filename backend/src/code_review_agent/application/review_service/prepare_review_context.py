@@ -39,7 +39,16 @@ class PrepareReviewContextService:
         else:
             workspace = self._workspace_query.get_by_repo_id(repo_id)
 
-        if workspace is None or workspace.last_synced_commit != graph_commit_hash:
+        if workspace is None:
+            raise GraphNotReadyError(repo_id, graph_commit_hash)
+
+        # The commit-mismatch gate applies only to the branch path: a worktree
+        # must be fast-forwarded and rebuilt before its graph is served. The
+        # plain graph_commit_hash path keeps Phase 1 semantics — the readiness
+        # of the requested commit's graph snapshot is the sole gate, so an
+        # earlier commit whose graph is ready remains servable (it never
+        # triggers a rebuild, and there is nothing to rebuild it from).
+        if branch is not None and workspace.last_synced_commit != graph_commit_hash:
             raise GraphNotReadyError(repo_id, graph_commit_hash)
 
         if not self._readiness.is_ready(repo_id, graph_commit_hash):

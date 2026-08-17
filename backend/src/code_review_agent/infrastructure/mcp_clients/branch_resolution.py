@@ -35,7 +35,13 @@ async def list_repo_branches(mcp_client, owner: str, repo: str) -> list[dict[str
     text = _extract_text(result)
     if not text:
         return []
-    payload = json.loads(text) if isinstance(text, str) else text
+    try:
+        payload = json.loads(text) if isinstance(text, str) else text
+    except ValueError:
+        # Non-JSON output (e.g. an MCP tool error/rate-limit payload) must not
+        # surface as an uncaught parse error -> 500. Treat it as a clean
+        # not-found so the caller can respond 404 instead.
+        raise BranchNotFoundError(owner, repo, "<all>") from None
     if isinstance(payload, dict) and isinstance(payload.get("branches"), list):
         return payload["branches"]
     if isinstance(payload, list):

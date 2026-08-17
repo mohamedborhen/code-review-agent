@@ -96,6 +96,32 @@ class PrepareReviewContextServiceTest(unittest.TestCase):
         with self.assertRaises(GraphNotReadyError):
             service.execute("acme/app", "def456", branch="missing")
 
+    def test_hash_path_serves_ready_older_commit(self):
+        # Regression (#1): the plain graph_commit_hash path must keep Phase 1
+        # semantics — readiness of the requested commit's snapshot is the sole
+        # gate. An earlier commit whose graph is ready is servable even though
+        # last_synced_commit differs (no unrecoverable 425).
+        service = PrepareReviewContextService(
+            _FakeWorkspaceQuery(
+                RepoWorkspace(repo_id="acme/app", branch="main", local_path="/ws/acme_app", last_synced_commit="abc123")
+            ),
+            _FakeReadiness(ready=True),
+        )
+        self.assertEqual(service.execute("acme/app", "older000"), "/ws/acme_app")
+
+    def test_branch_path_commit_mismatch_raises_graph_not_ready(self):
+        # The commit-mismatch gate still applies to the branch path: a worktree
+        # must be fast-forwarded + rebuilt before its graph is served.
+        service = PrepareReviewContextService(
+            _FakeWorkspaceQuery(
+                RepoWorkspace(repo_id="acme/app", branch="main", local_path="/ws/acme_app", last_synced_commit="abc123"),
+                branch_workspace=RepoWorkspace(repo_id="acme/app", branch="feature", local_path="/ws/acme_app__feature", last_synced_commit="def456"),
+            ),
+            _FakeReadiness(ready=True),
+        )
+        with self.assertRaises(GraphNotReadyError):
+            service.execute("acme/app", "other000", branch="feature")
+
 
 class RunReviewTest(unittest.TestCase):
     class _FakeOrchestrator:

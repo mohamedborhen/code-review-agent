@@ -1,7 +1,12 @@
 from sqlalchemy import event
 from sqlmodel import SQLModel, create_engine
 
+import logging
+import os
+
 from infrastructure.config import settings
+
+logger = logging.getLogger(__name__)
 
 engine = create_engine(f"sqlite:///{settings.metadata_db_path}")
 
@@ -62,9 +67,12 @@ def _rebuild_repoworkspace() -> None:
 
     Branch is backfilled deterministically from each row's real clone via
     ``detect_branch`` (never guessed/hardcoded), and ``last_requested_at`` is
-    backfilled from the existing ``updated_at``. Guarded: a fresh DB already has
-    the new shape (created by ``create_all`` above), so the rebuild is skipped
-    when the ``branch`` column is present.
+    backfilled from the existing ``updated_at``. A row whose ``local_path``
+    directory no longer exists is a stale/orphaned entry — it is skipped and
+    logged so it cannot brick startup; a live clone whose branch cannot be
+    determined still raises. Guarded: a fresh DB already has the new shape
+    (created by ``create_all`` above), so the rebuild is skipped when the
+    ``branch`` column is present.
     """
     from infrastructure.repo_source.git_repo_source import detect_branch
 
@@ -98,6 +106,19 @@ def _rebuild_repoworkspace() -> None:
         for row_id, repo_id, local_path, last_synced, created_at, updated_at in rows:
             branch = detect_branch(local_path)
             if not branch:
+                # Refuse to guess a branch (spec §7). A row whose local_path
+                # no longer exists is a stale/orphaned entry (e.g. its worktree
+                # was removed out-of-band) — skip and log it so a single stale
+                # row cannot brick application startup. A live clone whose
+                # branch genuinely cannot be determined still fails loudly.
+                if not os.path.isdir(local_path):
+                    logger.warning(
+                        "repoworkspace migration: skipping stale row repo=%r "
+                        "local_path=%r (directory no longer exists)",
+                        repo_id,
+                        local_path,
+                    )
+                    continue
                 raise RuntimeError(
                     f"repoworkspace migration: cannot determine branch at {local_path!r} "
                     f"for repo {repo_id!r}; refusing to guess"

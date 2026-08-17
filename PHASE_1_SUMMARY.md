@@ -238,7 +238,7 @@ CREATE INDEX ix_graphsnapshot_repo_id ON graphsnapshot(repo_id);
 - Composite `UNIQUE(repo_id, branch)` replaces the old `repo_id UNIQUE`; a non-unique index on `repo_id` remains.
 - New columns: `branch` and `last_requested_at` (recency signal for eviction; NULL for legacy rows → eviction falls back to `updated_at`).
 - `db/engine.py` runs a real **4-step rebuild migration** (create `repoworkspace_new` → INSERT backfill → DROP → RENAME) — **not** a guarded `ALTER TABLE` — guarded on `branch` column presence, transactional, idempotent.
-- Branch backfill is **deterministic**: `detect_branch` reads `git branch --show-current` first, then `git symbolic-ref refs/remotes/origin/HEAD` (default-branch fallback for the detached-HEAD case Phase 1's webhook `fetch+checkout` produces); raises rather than guessing. `last_requested_at` is derived from `updated_at`.
+- Branch backfill is **deterministic**: `detect_branch` reads `git branch --show-current` first, then `git symbolic-ref refs/remotes/origin/HEAD` (default-branch fallback for the detached-HEAD case Phase 1's webhook `fetch+checkout` produces); raises rather than guessing. `last_requested_at` is derived from `updated_at`. **Stale-row skip (review finding #3):** a row whose `local_path` directory no longer exists is a stale/orphaned entry (e.g. a worktree removed out-of-band) — it is **skipped and logged** so a single stale row cannot brick startup; a live clone whose branch genuinely cannot be determined still raises.
 - `get_by_repo_id` is scoped to the default-branch row; `get_by_repo_id_and_branch` and `repo_is_registered` were added. `graphsnapshot` is unchanged — still commit-keyed, one row per build attempt.
 
 ### Worktree lifecycle
@@ -256,7 +256,7 @@ CREATE INDEX ix_graphsnapshot_repo_id ON graphsnapshot(repo_id);
 `POST /review` with `body.branch` set:
 1. **Validate:** exactly one of `graph_commit_hash`/`branch` — both or neither → 400.
 2. **Resolve branch → commit** live via the GitHub MCP `list_branches` tool (`infrastructure/mcp_clients/branch_resolution.py`, async Layer 5, `scoped()`-reduced to exactly `{list_branches}`, using `request.app.state.mcp_client`). Unknown branch → 404 `BranchNotFoundError`; unregistered repo → 404.
-3. **Pre-flight:** `PrepareReviewContextService.execute(repo_id, resolved_commit, branch=branch)` returns the per-branch `local_path` or raises — 404 unregistered, 425 when the branch row is missing OR `last_synced_commit != resolved_commit` OR the graph isn't ready. It is **pure/side-effect-free** — it never triggers a build itself.
+3. **Pre-flight:** `PrepareReviewContextService.execute(repo_id, resolved_commit, branch=branch)` returns the per-branch `local_path` or raises — 404 unregistered, 425 when the branch row is missing OR `last_synced_commit != resolved_commit` OR the graph isn't ready. **The commit-mismatch gate is scoped to the branch path only (review finding #1):** the plain `graph_commit_hash` path keeps Phase 1 semantics — readiness of the requested commit's graph snapshot is its sole gate, so a ready *older* commit is served even when the base clone has moved past it (there is no worktree to rebuild, so gating on the mismatch would produce an unrecoverable 425). It is **pure/side-effect-free** — it never triggers a build itself.
 4. **On 425-with-branch:** the route dispatches `EnsureBranchWorktreeService.execute(...)` as a FastAPI `BackgroundTasks` task, then returns 425 immediately. A later `POST /review` for the same (repo, branch) at the resolved commit passes pre-flight.
 
 > **D-11 fix (important):** the background task is attached via returning a `JSONResponse(status_code=425, ...)` with `response.background = background_tasks` set. `raise HTTPException(425)` silently **drops** the queued task (FastAPI only attaches `BackgroundTasks` on the normal return path) — verified against installed FastAPI source and live.
@@ -274,11 +274,19 @@ CREATE INDEX ix_graphsnapshot_repo_id ON graphsnapshot(repo_id);
 
 - `process_webhook(repo_id, branch, commit_sha)` is a **no-op** for a push to any non-default (worktree) branch.
 - `000…0` (branch deletion) is now a real **dispatch** to `cleanup_deleted_branch` (not an early return): it runs `git worktree remove` + `git worktree prune` in the base clone, deletes the per-branch `repoworkspace` row, and **leaves `graphsnapshot` rows** (they're commit-keyed and may back past audit rows). PR-closed is NOT a trigger.
-- New read-only `GET /repos/{repo_id:path}/branches` proxies all remote branches (404 for unregistered repos). `{repo_id:path}` is required because `repo_id` is `owner/repo` (contains a slash).
+- New read-only `GET /repos/{repo_id:path}/branches` proxies all remote branches (404 for unregistered repos). `{repo_id:path}` is required because `repo_id` is `owner/repo` (contains a slash). Non-JSON tool output (e.g. an MCP tool error / rate-limit payload) is guarded — `json.loads` wrapped in `try/except ValueError` → `BranchNotFoundError` (review finding #4) — so it surfaces as a clean 404 instead of an uncaught parse error → 500.
 
 ### Eviction (§11) — worktree-aware
 
-`WorkspaceEvictionService` orders rows by `last_requested_at` (fallback `updated_at`), resolves the base clone as the sibling `{root}/{sanitize_repo_id(repo_id)}`, and for a worktree uses `git worktree remove --force` + `git worktree prune` so the base clone's `.git/worktrees` metadata is cleaned (falling back to `shutil.rmtree` for a base clone or when the base is missing). `max_gb=10.0` default unchanged; wired to run once off the event loop in the lifespan. (The base-clone path is resolved deterministically — earlier a walk-up attempt could never reach the sibling base and caused `rmtree` to leave stale metadata; fixed in `_find_base_clone` and covered by unit tests.)
+`WorkspaceEvictionService` orders rows by `last_requested_at` (fallback `updated_at`), resolves the base clone as the sibling `{root}/{sanitize_repo_id(repo_id)}`, and for a worktree uses `git worktree remove --force` + `git worktree prune` so the base clone's `.git/worktrees` metadata is cleaned (falling back to `shutil.rmtree` for a base clone or when the base is missing). `max_gb=10.0` default unchanged; wired to run once off the event loop in the lifespan. (The base-clone path is resolved deterministically — earlier a walk-up attempt could never reach the sibling base and caused `rmtree` to leave stale metadata; fixed in `_find_base_clone` and covered by unit tests.) The recency signal is refreshed on the `POST /review` success path for branch rows via `_touch_recency` (`review.py`): a best-effort `touch_requested_at` wrapped in `try/except` (log + continue) so a bookkeeping failure (SQLite locked past `busy_timeout`, I/O error) can never abort the review before its audit rows are written — review finding #2.
+
+### Frontend-Phase Notes (recorded now for the React frontend — do not build here)
+
+These three points are the frontend contract for the branch-switch UI, captured during the Branch-Aware work so they are not reverse-engineered later:
+
+- **Required — the branch-switch dropdown must be populated from `GET /repos/{repo_id:path}/branches` (the GitHub-backed proxy), NOT from `RepoWorkspace`.** That endpoint returns *every remote branch* (`[{name, sha, protected}]`); `RepoWorkspace` only ever holds the branches that have actually been reviewed (the default-branch row after `POST /repos`, plus one row per branch a review was requested on). A dropdown built from `RepoWorkspace` would be near-empty right after repo registration. First-time click on an unbuilt branch → 425 → background worktree build → poll `POST /review` until 200.
+- **Required verification (before the frontend phase) — confirm whether the GitHub MCP `list_branches` tool paginates.** If it caps the result set (e.g. ~30 branches), a large repo would silently show a partial dropdown. Verify the live tool name with `mcpcurl tools --help` (AGENTS.md standing rule) and, if pagination is confirmed, handle it inside `list_repo_branches` (`branch_resolution.py`) before the UI depends on completeness.
+- **Optional — add a readiness probe so the UI does not poll `POST /review`.** Today the only way to distinguish "graph still building" (425) from "done" (200) is to re-submit the full review payload, which re-runs the pre-flight and could re-queue work. A lightweight read-only probe — e.g. `GET /api/v1/repos/{repo_id}/branches/{branch}/readiness` → `{"ready": true, "commit": ...}` or `{"ready": false}` — would let the UI poll cheaply without side effects.
 
 ### Documented deviations (in `OPENCODE.md`)
 
@@ -558,10 +566,10 @@ CMD ["code-review-graph", "serve", "--http", "--port", "5555", "--host", "0.0.0.
 | Git clone stderr exposed | ✅ | `_run_git` raises `RuntimeError(stderr)` |
 | Stale directory cleanup before clone | ✅ | `shutil.rmtree(target_path)` inside lock |
 | Upsert for re-registering same repo | ✅ | `register_and_build` checks existing row before INSERT; avoids UNIQUE constraint crash |
-| Workspace eviction (LRU) | ✅ | Worktree-aware, wired to lifespan (Branch-Aware §11); code complete |
+| Workspace eviction (LRU) | ✅ | Worktree-aware, wired to lifespan (Branch-Aware §11); code complete; deterministic sibling base-clone resolution + `_touch_recency` best-effort recency refresh |
 | Branch-aware webhooks (§6/§9) | ✅ | `process_webhook` no-ops non-default branch pushes; `000…0` → real cleanup dispatch; `GET /repos/{repo_id}/branches` read-only proxy |
-| Per-branch review (`POST /review` + branch) | ✅ | Resolve branch→commit via GitHub `list_branches` (404 unknown), 425 → background `EnsureBranchWorktreeService` (D-11 JSONResponse fix) |
-| `RepoWorkspace` per (repo_id, branch) | ✅ | `UNIQUE(repo_id, branch)`, 4-step rebuild migration, deterministic branch backfill |
+| Per-branch review (`POST /review` + branch) | ✅ | Resolve branch→commit via GitHub `list_branches` (404 unknown), 425 → background `EnsureBranchWorktreeService` (D-11 JSONResponse fix); commit-mismatch gate scoped to branch path only (fix #1) |
+| `RepoWorkspace` per (repo_id, branch) | ✅ | `UNIQUE(repo_id, branch)`, 4-step rebuild migration, deterministic branch backfill; stale-row skip (fix #3) |
 | Worktree lifecycle | ✅ | `create_worktree` (fetch-then-add, shallow-clone fix), `update_worktree` (fetch + reset --hard), full-rebuild fallback on force-push base-unreachable |
 | Per-branch locks (§8) | ✅ | `acquire_workspace_lock(branch=None)`, `.{safe}_{safe_branch}.lock`, `try_acquire_lock` probe |
 
