@@ -19,6 +19,7 @@ def init_db() -> None:
 
     SQLModel.metadata.create_all(engine)
     _add_model_columns()
+    _rebuild_repoworkspace()
 
 
 def _add_model_columns() -> None:
@@ -48,3 +49,76 @@ def _add_model_columns() -> None:
                 conn.exec_driver_sql(
                     f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
                 )
+
+
+def _rebuild_repoworkspace() -> None:
+    """4-step SQLite table rebuild: ``repoworkspace`` becomes per-branch.
+
+    ``create_all`` only creates missing tables and ``_add_model_columns`` only
+    adds columns — neither can change ``repo_id UNIQUE`` into the composite
+    ``UNIQUE(repo_id, branch)`` the Branch-Aware addendum requires (§7). SQLite
+    supports no constraint changes via ALTER TABLE, so the standard 4-step
+    rebuild (create/insert/drop/rename) runs inside one transaction.
+
+    Branch is backfilled deterministically from each row's real clone via
+    ``detect_branch`` (never guessed/hardcoded), and ``last_requested_at`` is
+    backfilled from the existing ``updated_at``. Guarded: a fresh DB already has
+    the new shape (created by ``create_all`` above), so the rebuild is skipped
+    when the ``branch`` column is present.
+    """
+    from infrastructure.repo_source.git_repo_source import detect_branch
+
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(repoworkspace)")}
+        if "branch" in cols:
+            return
+
+        rows = conn.exec_driver_sql(
+            "SELECT id, repo_id, local_path, last_synced_commit, created_at, updated_at "
+            "FROM repoworkspace"
+        ).fetchall()
+
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE repoworkspace_new (
+                id INTEGER NOT NULL,
+                repo_id VARCHAR NOT NULL,
+                branch VARCHAR NOT NULL,
+                local_path VARCHAR NOT NULL,
+                last_synced_commit VARCHAR,
+                last_requested_at DATETIME NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                UNIQUE (repo_id, branch)
+            )
+            """
+        )
+
+        for row_id, repo_id, local_path, last_synced, created_at, updated_at in rows:
+            branch = detect_branch(local_path)
+            if not branch:
+                raise RuntimeError(
+                    f"repoworkspace migration: cannot determine branch at {local_path!r} "
+                    f"for repo {repo_id!r}; refusing to guess"
+                )
+            conn.exec_driver_sql(
+                "INSERT INTO repoworkspace_new "
+                "(id, repo_id, branch, local_path, last_synced_commit, "
+                "last_requested_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row_id,
+                    repo_id,
+                    branch,
+                    local_path,
+                    last_synced,
+                    updated_at,
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+        conn.exec_driver_sql("DROP TABLE repoworkspace")
+        conn.exec_driver_sql("ALTER TABLE repoworkspace_new RENAME TO repoworkspace")
+        conn.exec_driver_sql("CREATE INDEX ix_repoworkspace_repo_id ON repoworkspace (repo_id)")

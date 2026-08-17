@@ -12,7 +12,13 @@ from domain.review.review_context_ports import GraphReadinessPort, RepoWorkspace
 
 
 class PrepareReviewContextService:
-    """Return the DB-resolved repo_root (local_path), raising on bad input."""
+    """Return the DB-resolved repo_root (local_path), raising on bad input.
+
+    ``branch`` selects a per-branch workspace row (Branch-Aware addendum §5);
+    when None, the default-branch (base-clone) row is used, preserving Phase 1
+    semantics for the plain graph_commit_hash path. The use-case is pure and
+    side-effect-free — it never triggers a build; the route does that.
+    """
 
     def __init__(
         self,
@@ -22,10 +28,19 @@ class PrepareReviewContextService:
         self._workspace_query = workspace_query
         self._readiness = readiness
 
-    def execute(self, repo_id: str, graph_commit_hash: str) -> str:
-        workspace = self._workspace_query.get_by_repo_id(repo_id)
-        if workspace is None:
+    def execute(
+        self, repo_id: str, graph_commit_hash: str, branch: str | None = None
+    ) -> str:
+        if not self._workspace_query.repo_is_registered(repo_id):
             raise RepoNotFoundError(repo_id)
+
+        if branch is not None:
+            workspace = self._workspace_query.get_by_repo_id_and_branch(repo_id, branch)
+        else:
+            workspace = self._workspace_query.get_by_repo_id(repo_id)
+
+        if workspace is None or workspace.last_synced_commit != graph_commit_hash:
+            raise GraphNotReadyError(repo_id, graph_commit_hash)
 
         if not self._readiness.is_ready(repo_id, graph_commit_hash):
             raise GraphNotReadyError(repo_id, graph_commit_hash)

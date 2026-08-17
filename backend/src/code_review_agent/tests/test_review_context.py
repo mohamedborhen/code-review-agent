@@ -20,12 +20,21 @@ from domain.entities.repo_workspace import RepoWorkspace
 
 
 class _FakeWorkspaceQuery:
-    def __init__(self, workspace: RepoWorkspace | None) -> None:
+    def __init__(self, workspace: RepoWorkspace | None, branch_workspace: RepoWorkspace | None = None) -> None:
         self._workspace = workspace
+        self._branch_workspace = branch_workspace
+        self.last_repo_id = None
 
     def get_by_repo_id(self, repo_id: str) -> RepoWorkspace | None:
         self.last_repo_id = repo_id
         return self._workspace
+
+    def get_by_repo_id_and_branch(self, repo_id: str, branch: str) -> RepoWorkspace | None:
+        self.last_repo_id = repo_id
+        return self._branch_workspace
+
+    def repo_is_registered(self, repo_id: str) -> bool:
+        return self._workspace is not None or self._branch_workspace is not None
 
 
 class _FakeReadiness:
@@ -41,10 +50,22 @@ class _FakeReadiness:
 class PrepareReviewContextServiceTest(unittest.TestCase):
     def test_returns_local_path(self):
         service = PrepareReviewContextService(
-            _FakeWorkspaceQuery(RepoWorkspace(repo_id="acme/app", local_path="/ws/acme_app")),
+            _FakeWorkspaceQuery(
+                RepoWorkspace(repo_id="acme/app", branch="main", local_path="/ws/acme_app", last_synced_commit="abc123")
+            ),
             _FakeReadiness(ready=True),
         )
         self.assertEqual(service.execute("acme/app", "abc123"), "/ws/acme_app")
+
+    def test_branch_path_returns_branch_local_path(self):
+        service = PrepareReviewContextService(
+            _FakeWorkspaceQuery(
+                RepoWorkspace(repo_id="acme/app", branch="main", local_path="/ws/acme_app", last_synced_commit="abc123"),
+                branch_workspace=RepoWorkspace(repo_id="acme/app", branch="feature", local_path="/ws/acme_app__feature", last_synced_commit="def456"),
+            ),
+            _FakeReadiness(ready=True),
+        )
+        self.assertEqual(service.execute("acme/app", "def456", branch="feature"), "/ws/acme_app__feature")
 
     def test_unknown_repo_raises_repo_not_found(self):
         service = PrepareReviewContextService(
@@ -56,11 +77,24 @@ class PrepareReviewContextServiceTest(unittest.TestCase):
 
     def test_unready_graph_raises_graph_not_ready(self):
         service = PrepareReviewContextService(
-            _FakeWorkspaceQuery(RepoWorkspace(repo_id="acme/app", local_path="/ws/acme_app")),
+            _FakeWorkspaceQuery(
+                RepoWorkspace(repo_id="acme/app", branch="main", local_path="/ws/acme_app", last_synced_commit="abc123")
+            ),
             _FakeReadiness(ready=False),
         )
         with self.assertRaises(GraphNotReadyError):
             service.execute("acme/app", "abc123")
+
+    def test_unknown_branch_raises_graph_not_ready(self):
+        service = PrepareReviewContextService(
+            _FakeWorkspaceQuery(
+                RepoWorkspace(repo_id="acme/app", branch="main", local_path="/ws/acme_app", last_synced_commit="abc123"),
+                branch_workspace=None,
+            ),
+            _FakeReadiness(ready=True),
+        )
+        with self.assertRaises(GraphNotReadyError):
+            service.execute("acme/app", "def456", branch="missing")
 
 
 class RunReviewTest(unittest.TestCase):

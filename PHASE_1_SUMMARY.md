@@ -75,6 +75,7 @@ AI code reviewer agent/
 │   │   └── repo/
 │   │       └── repo_source_port.py         # Protocol: clone(repo_url, local_path) → str(sha)
 │   │                                       #           sync(local_path, ref) → str(sha)
+│   │                                       #           create_worktree / update_worktree / current_branch (D-8)
 │   │
 │   ├── application/                        # ═══ LAYER 3: APPLICATION ═══
 │   │   ├── repo_ingestion_service/
@@ -91,6 +92,10 @@ AI code reviewer agent/
 │   │       └── graph_readiness_service.py  # GraphReadinessService:
 │   │                                       #     Query GraphSnapshot by repo_id + commit_hash
 │   │                                       #     Return bool: is graph ready? (for Phase 2)
+│   │   └── repo_ingestion_service/ensure_branch_worktree.py  # NEW (Branch-Aware §5)
+│   │                                       #     EnsureBranchWorktreeService: create/update worktree
+│   │                                       #     + build/update graph; records last_synced_commit +
+│   │                                       #     GraphSnapshot; releases per-branch lock in finally
 │   │
 │   └── infrastructure/                     # ═══ LAYER 5+2: INFRASTRUCTURE + API ═══
 │       ├── config.py                       # pydantic-settings BaseSettings
@@ -100,15 +105,18 @@ AI code reviewer agent/
 │       ├── api/routes/
 │       │   └── webhooks.py                 # POST /api/v1/webhook  — GitHub push events
 │       │                                   # POST /api/v1/repos    — Register new repo
+│       │                                   # GET /api/v1/repos/{repo_id}/branches  — NEW (read-only proxy)
 │       │                                   # HMAC-SHA256 verification (sync, before add_task)
+│       │                                   # Branch-aware: process_webhook no-ops for non-default branch
 │       │                                   # BackgroundTasks for slow work
 │       │
 │       ├── db/
 │       │   ├── engine.py                   # create_engine("sqlite:///...") — synchronous
 │       │   │                               #     init_db(): SQLModel.metadata.create_all(engine)
 │       │   └── models.py                   # SQLModel table classes:
-│       │                                   #     RepoWorkspace(id, repo_id, local_path,
-│       │                                   #         last_synced_commit, created_at, updated_at)
+│       │                                   #     RepoWorkspace(id, repo_id, branch, local_path,
+│       │                                   #         last_synced_commit, last_requested_at, created_at, updated_at)
+│       │                                   #         UNIQUE(repo_id, branch) — one row per branch (Branch-Aware)
 │       │                                   #     GraphSnapshot(id, repo_id, commit_hash,
 │       │                                   #         status, error_message, started_at, completed_at)
 │       │
@@ -130,14 +138,19 @@ AI code reviewer agent/
 │       │                                   #     subprocess.run(["git", ...])
 │       │                                   #     clone: shutil.rmtree stale dirs first
 │       │                                   #     _run_git: manual returncode check + stderr in RuntimeError
+│       │                                   #     create_worktree: fetch <b>:<b> then git worktree add (shallow-clone fix)
+│       │                                   #     update_worktree: fetch + reset --hard origin/<b>; returns HEAD sha
 │       │
 │       └── workspace/
 │           ├── workspace_lock.py           # acquire_workspace_lock: FileLock(/.{safe}.lock)
 │           │                               #     Lock file OUTSIDE workspace dir (avoids Windows
 │           │                               #     PermissionError on locked files during shutil.rmtree)
-│           ├── workspace_path_resolver.py  # sanitize_repo_id + resolve_workspace_path
-│           └── workspace_eviction_service.py # LRU eviction by last-updated date (code complete,
-│                                             #     not yet wired to background task)
+│           │                               #     branch=None keeps default key; per-branch key .{safe}_{safe_branch}.lock
+│           │                               #     try_acquire_lock: timeout=0 non-blocking probe (Branch-Aware §8)
+│           ├── workspace_path_resolver.py  # sanitize_repo_id + resolve_workspace_path + resolve_worktree_path
+│           └── workspace_eviction_service.py # Worktree-aware LRU by last_requested_at (Branch-Aware §11):
+│                                             #     git worktree remove + prune for worktrees, rmtree fallback;
+│                                             #     base clone resolved as sibling {root}/{safe_id}; wired to lifespan
 │
 ├── docker-compose.yaml                     # Two services + named volume + healthcheck
 │                                           #     code-review-agent (port 8000, depends_on with
@@ -184,12 +197,16 @@ File: `data/phase1_metadata.db` (SQLite, synchronous engine)
 
 CREATE TABLE repoworkspace (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_id            VARCHAR NOT NULL UNIQUE,       -- e.g. "mohamedborhen/CLIP-DRDG"
+    repo_id            VARCHAR NOT NULL,               -- e.g. "mohamedborhen/CLIP-DRDG"
+    branch             VARCHAR NOT NULL,               -- branch this row tracks; default-branch row = base clone
     local_path         VARCHAR NOT NULL,               -- e.g. ".../data/workspaces/mohamedborhen_clip-drdg"
     last_synced_commit VARCHAR,                         -- SHA of last successfully built commit
+    last_requested_at  DATETIME,                        -- recency signal for worktree-aware eviction (NULL on legacy rows)
     created_at         DATETIME NOT NULL,               -- Auto-set
     updated_at         DATETIME NOT NULL                -- Updated on each successful sync
 );
+-- One row per (repo_id, branch) — Branch-Aware addendum §7
+CREATE UNIQUE INDEX ux_repoworkspace_repo_branch ON repoworkspace(repo_id, branch);
 CREATE INDEX ix_repoworkspace_repo_id ON repoworkspace(repo_id);
 
 CREATE TABLE graphsnapshot (
@@ -207,6 +224,68 @@ CREATE INDEX ix_graphsnapshot_repo_id ON graphsnapshot(repo_id);
 **Why two tables?**
 - `repoworkspace` is the **registry**: tracks which repos are known, where they live on disk, and their last indexed commit (needed for incremental updates).
 - `graphsnapshot` is the **audit log**: records every build attempt (success or failure). Without it, errors in background tasks would be invisible.
+
+---
+
+## 4b. Branch Handling (Branch-Aware addendum to Phase 2)
+
+**Phase 1 built the base layer that only ever tracked one working tree per repo (the default branch).** The Branch-Aware addendum (specified in `Branch-Aware Graph Management.md`, built as part of Phase 2) extends this so the system can review **per-branch** code. The trigger model is **manual only**: a branch worktree and its graph are created or updated for exactly one reason — a user submits a `POST /review` for that `(repo_id, branch)` pair. UI branch selection has no side effect on its own.
+
+### Schema change — one row per (repo_id, branch)
+
+`repoworkspace` went from "one row per repo" to **one row per `(repo_id, branch)`**:
+
+- Composite `UNIQUE(repo_id, branch)` replaces the old `repo_id UNIQUE`; a non-unique index on `repo_id` remains.
+- New columns: `branch` and `last_requested_at` (recency signal for eviction; NULL for legacy rows → eviction falls back to `updated_at`).
+- `db/engine.py` runs a real **4-step rebuild migration** (create `repoworkspace_new` → INSERT backfill → DROP → RENAME) — **not** a guarded `ALTER TABLE` — guarded on `branch` column presence, transactional, idempotent.
+- Branch backfill is **deterministic**: `detect_branch` reads `git branch --show-current` first, then `git symbolic-ref refs/remotes/origin/HEAD` (default-branch fallback for the detached-HEAD case Phase 1's webhook `fetch+checkout` produces); raises rather than guessing. `last_requested_at` is derived from `updated_at`.
+- `get_by_repo_id` is scoped to the default-branch row; `get_by_repo_id_and_branch` and `repo_is_registered` were added. `graphsnapshot` is unchanged — still commit-keyed, one row per build attempt.
+
+### Worktree lifecycle
+
+- **Paths (§12):** a worktree is a **sibling** of the base clone, still under `WORKSPACE_ROOT` (so the CRG server container sees it): base clone at `{root}/{safe_id}`, worktree at `{root}/{safe_id}__{safe_branch}` (`workspace_path_resolver.py` → `resolve_workspace_path` / `resolve_worktree_path`). No `CRG_DATA_DIR` override — worktree isolation is by filesystem path (verified against CRG docs before implementation).
+- **Create (§3):** `GitRepoSource.create_worktree` runs `git fetch origin <branch>:<branch>` into the base clone first (a Phase 1 clone is shallow/`--depth 1`/single-branch, so the ref must be fetched or `git worktree add` fails), then `git worktree add <path> <branch>`; returns the checked-out HEAD sha.
+- **Update (§3):** `update_worktree` runs `git fetch origin <branch>:refs/remotes/origin/<branch>` then `git reset --hard origin/<branch>` (fetch alone wouldn't update the checked-out files) and returns the new HEAD sha.
+- **Orchestration (§5):** `EnsureBranchWorktreeService` (`application/repo_ingestion_service/ensure_branch_worktree.py`, sync, injected `RepoSourcePort` + `GraphBuilderPort` + a `WorkspaceStore` protocol):
+  - **No row yet** → `create_worktree` + full `build()` (`full_rebuild=True`), then record `last_synced_commit` + a `GraphSnapshot`.
+  - **Row exists but tip advanced** → `update_worktree` + incremental `update(base=old last_synced_commit)`; if that returns non-ready (e.g. force-push made the diff base unreachable), **fall back to a full `build()`**.
+  - Releases the per-branch lock in a `finally`; errors are recorded as `GraphSnapshot(status="error")`.
+
+### Trigger flow through `POST /review`
+
+`POST /review` with `body.branch` set:
+1. **Validate:** exactly one of `graph_commit_hash`/`branch` — both or neither → 400.
+2. **Resolve branch → commit** live via the GitHub MCP `list_branches` tool (`infrastructure/mcp_clients/branch_resolution.py`, async Layer 5, `scoped()`-reduced to exactly `{list_branches}`, using `request.app.state.mcp_client`). Unknown branch → 404 `BranchNotFoundError`; unregistered repo → 404.
+3. **Pre-flight:** `PrepareReviewContextService.execute(repo_id, resolved_commit, branch=branch)` returns the per-branch `local_path` or raises — 404 unregistered, 425 when the branch row is missing OR `last_synced_commit != resolved_commit` OR the graph isn't ready. It is **pure/side-effect-free** — it never triggers a build itself.
+4. **On 425-with-branch:** the route dispatches `EnsureBranchWorktreeService.execute(...)` as a FastAPI `BackgroundTasks` task, then returns 425 immediately. A later `POST /review` for the same (repo, branch) at the resolved commit passes pre-flight.
+
+> **D-11 fix (important):** the background task is attached via returning a `JSONResponse(status_code=425, ...)` with `response.background = background_tasks` set. `raise HTTPException(425)` silently **drops** the queued task (FastAPI only attaches `BackgroundTasks` on the normal return path) — verified against installed FastAPI source and live.
+
+### When a graph actually updates (the exact rule)
+
+- **Default branch (base clone):** auto-updates on every webhook push via `SyncOnWebhookService` (unchanged Phase 1 behavior). `process_webhook` is **branch-aware**: it only acts when the pushed branch equals the default-branch row's branch (`base.branch != branch` → no-op).
+- **Non-default (worktree) branch:** updates **only when a user submits `POST /review` for that branch**, and only if the branch's remote tip has moved past what was last built (the 425 → `EnsureBranchWorktreeService`). A push to the branch is a **webhook no-op** — it does not update that branch's graph. Because `branch_resolution` resolves the *current remote tip*, the next review of the branch detects any advance and triggers the incremental update. If the branch is already current, submitting a review reuses the existing graph (no rebuild).
+
+### Locks (§8) — branch-scoped
+
+`acquire_workspace_lock(workspace_root, repo_id, branch=None)`: scope moved from `repo_id` to `(repo_id, branch)`. A branch lock file is `.{safe_id}_{safe_branch}.lock`; `branch=None` keeps the Phase 1 default key `.{safe_id}.lock` so existing registration call sites stay valid. `try_acquire_lock` (`timeout=0`) is a non-blocking probe the route uses to skip dispatch when another request is already building the branch.
+
+### Webhooks (§6, §9) — branch-aware
+
+- `process_webhook(repo_id, branch, commit_sha)` is a **no-op** for a push to any non-default (worktree) branch.
+- `000…0` (branch deletion) is now a real **dispatch** to `cleanup_deleted_branch` (not an early return): it runs `git worktree remove` + `git worktree prune` in the base clone, deletes the per-branch `repoworkspace` row, and **leaves `graphsnapshot` rows** (they're commit-keyed and may back past audit rows). PR-closed is NOT a trigger.
+- New read-only `GET /repos/{repo_id:path}/branches` proxies all remote branches (404 for unregistered repos). `{repo_id:path}` is required because `repo_id` is `owner/repo` (contains a slash).
+
+### Eviction (§11) — worktree-aware
+
+`WorkspaceEvictionService` orders rows by `last_requested_at` (fallback `updated_at`), resolves the base clone as the sibling `{root}/{sanitize_repo_id(repo_id)}`, and for a worktree uses `git worktree remove --force` + `git worktree prune` so the base clone's `.git/worktrees` metadata is cleaned (falling back to `shutil.rmtree` for a base clone or when the base is missing). `max_gb=10.0` default unchanged; wired to run once off the event loop in the lifespan. (The base-clone path is resolved deterministically — earlier a walk-up attempt could never reach the sibling base and caused `rmtree` to leave stale metadata; fixed in `_find_base_clone` and covered by unit tests.)
+
+### Documented deviations (in `OPENCODE.md`)
+
+- **D-8** — `RepoSourcePort` carries three new methods (`create_worktree`, `update_worktree`, `current_branch`); the spec names two — `current_branch` supports the migration backfill + `clone_repository` (a plain git read).
+- **D-9** — the route wires a module-level `EnsureBranchWorktreeService` instance + `BackgroundTasks` instead of a spec-named module function; functionally equivalent composition root.
+- **D-10** — branch identity for a non-default worktree row is the requested branch string (the worktree checkout fixes the commit); `last_synced_commit` records the built commit.
+- **D-11** — see the 425 dispatch note above.
 
 ---
 
@@ -300,6 +379,8 @@ GitHub POST /api/v1/webhook
 [Background thread - process_webhook()]:
   ├─ Session(engine) → SELECT * FROM repoworkspace WHERE repo_id = ?
   │   └─ If None → log warning, return (untracked repo)
+  ├─ Branch-aware (Branch-Aware §6): if pushed branch != default-branch row's branch → no-op
+  │   (non-default/worktree branch pushes never auto-sync — they update only via POST /review)
   ├─ acquire_workspace_lock(workspace_root, repo_id)
   ├─ with lock:
   │   ├─ SyncOnWebhookService.execute()
@@ -477,7 +558,12 @@ CMD ["code-review-graph", "serve", "--http", "--port", "5555", "--host", "0.0.0.
 | Git clone stderr exposed | ✅ | `_run_git` raises `RuntimeError(stderr)` |
 | Stale directory cleanup before clone | ✅ | `shutil.rmtree(target_path)` inside lock |
 | Upsert for re-registering same repo | ✅ | `register_and_build` checks existing row before INSERT; avoids UNIQUE constraint crash |
-| Workspace eviction (LRU) | ✅ | Code complete, not yet wired to background cron |
+| Workspace eviction (LRU) | ✅ | Worktree-aware, wired to lifespan (Branch-Aware §11); code complete |
+| Branch-aware webhooks (§6/§9) | ✅ | `process_webhook` no-ops non-default branch pushes; `000…0` → real cleanup dispatch; `GET /repos/{repo_id}/branches` read-only proxy |
+| Per-branch review (`POST /review` + branch) | ✅ | Resolve branch→commit via GitHub `list_branches` (404 unknown), 425 → background `EnsureBranchWorktreeService` (D-11 JSONResponse fix) |
+| `RepoWorkspace` per (repo_id, branch) | ✅ | `UNIQUE(repo_id, branch)`, 4-step rebuild migration, deterministic branch backfill |
+| Worktree lifecycle | ✅ | `create_worktree` (fetch-then-add, shallow-clone fix), `update_worktree` (fetch + reset --hard), full-rebuild fallback on force-push base-unreachable |
+| Per-branch locks (§8) | ✅ | `acquire_workspace_lock(branch=None)`, `.{safe}_{safe_branch}.lock`, `try_acquire_lock` probe |
 
 ---
 
@@ -549,7 +635,6 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/webhook -Method Post -Body $
 | Item | Impact | When to fix |
 |---|---|---|
 | `BackgroundTasks` have no persistence | If the process crashes between webhook ack and task completion, the update is silently lost | Phase 2+ with a proper task queue (Celery/Redis) |
-| Workspace eviction not wired | The LRU eviction code exists but no cron/background task calls it | Phase 2 |
 | `SyncOnWebhookService.execute()` base defaults to `HEAD~1` if `last_indexed_commit` is None | Safe but may re-parse the most recent commit unnecessarily | Phase 2 when first-commit edge cases are handled |
 | No API key for `POST /repos` | Anyone who can reach the endpoint can register repos | Phase 2 with auth middleware |
 | `graphsnapshot.started_at` uses `datetime.utcnow()` (deprecated) in SQLModel field defaults | Works but produces deprecation warning in Python 3.12+ | Next maintenance pass |

@@ -274,7 +274,8 @@ from pydantic import BaseModel
 
 class ReviewRequest(BaseModel):
     repo_id: str
-    graph_commit_hash: str
+    graph_commit_hash: str | None = None   # optional — exactly ONE of this OR branch is required (400 if both/neither)
+    branch: str | None = None              # optional — per-branch review (Branch-Aware addendum); see Branch Handling below
     request_type: str        # must match a key in the Routing Policy below; the route 400s on unknown types
     diff_content: str | None = None   # optional — explain_question etc. may not need one
     question: str | None = None       # optional — free-form question; steers any_question (available pool) AND the single-specialist question types (compliance_question / security_question / performance_question / impact_question). Ignored by review (full pipeline) and explain_question.
@@ -290,6 +291,8 @@ Two checks that must both happen before any subagent runs, combined into one use
 # domain/review/review_context_ports.py  (Layer 4, plain Protocol — no framework, no SQL)
 class RepoWorkspaceQueryPort(Protocol):
     def get_by_repo_id(self, repo_id: str) -> RepoWorkspace | None: ...
+    def get_by_repo_id_and_branch(self, repo_id: str, branch: str) -> RepoWorkspace | None: ...
+    def repo_is_registered(self, repo_id: str) -> bool: ...
 
 class GraphReadinessPort(Protocol):
     def is_ready(self, repo_id: str, commit_hash: str) -> bool: ...
@@ -298,13 +301,19 @@ class GraphReadinessPort(Protocol):
 class PrepareReviewContextService:
     def __init__(self, workspace_query: RepoWorkspaceQueryPort, readiness: GraphReadinessPort) -> None: ...
 
-    def execute(self, repo_id: str, graph_commit_hash: str) -> str:
-        """Returns repo_root (local_path). Raises RepoNotFoundError / GraphNotReadyError."""
-        workspace = self._workspace_query.get_by_repo_id(repo_id)  # None -> RepoNotFoundError (404)
-        if workspace is None:
-            raise RepoNotFoundError(repo_id)
-        if not self._readiness.is_ready(repo_id, graph_commit_hash):  # Phase 1's service, sync
-            raise GraphNotReadyError(repo_id, graph_commit_hash)      # -> 425
+    def execute(self, repo_id: str, graph_commit_hash: str, branch: str | None = None) -> str:
+        """Returns repo_root (local_path). Raises RepoNotFoundError / GraphNotReadyError.
+        ``branch`` selects a per-branch workspace row (Branch-Aware addendum §5);
+        None keeps the default-branch (base-clone) row, preserving Phase 1 semantics.
+        Pure and side-effect-free — it never triggers a build; the route does that."""
+        if not self._workspace_query.repo_is_registered(repo_id):
+            raise RepoNotFoundError(repo_id)                       # -> 404
+        workspace = self._workspace_query.get_by_repo_id_and_branch(repo_id, branch) \
+            if branch is not None else self._workspace_query.get_by_repo_id(repo_id)
+        if workspace is None or workspace.last_synced_commit != graph_commit_hash:
+            raise GraphNotReadyError(repo_id, graph_commit_hash)   # -> 425
+        if not self._readiness.is_ready(repo_id, graph_commit_hash):
+            raise GraphNotReadyError(repo_id, graph_commit_hash)   # -> 425
         return workspace.local_path
 
 # infrastructure/api/routes/review.py  (Layer 2 composition root)
@@ -312,7 +321,7 @@ _prepare_context = PrepareReviewContextService(
     SQLModelRepoWorkspaceRepository(),                # infra/db/repo_workspace_repository.py
     GraphReadinessService(SQLModelGraphStatusQuery()), # infra/db/graph_status_repository.py
 )
-# repo_root = _prepare_context.execute(body.repo_id, body.graph_commit_hash)
+# repo_root = _prepare_context.execute(body.repo_id, body.graph_commit_hash, branch=body.branch)
 #   RepoNotFoundError   -> HTTPException(404, f"Unknown repo_id: {repo_id}")
 #   GraphNotReadyError  -> HTTPException(425, "Graph not ready for this commit yet")
 ```
@@ -324,6 +333,65 @@ _prepare_context = PrepareReviewContextService(
 **Async note:** `GraphReadinessService` and the `RepoWorkspace` lookup are Phase 1 code — synchronous, by Phase 1's own design. Calling a sync DB read directly inside this phase's `async def` route would block the event loop for its duration. For a single fast SQLite read this is a minor, acceptable exception in practice — but if you want to keep the async layer strictly non-blocking, wrap the call: `repo_root = await asyncio.to_thread(_prepare_context.execute, body.repo_id, body.graph_commit_hash)` from the route handler. Either is acceptable; pick one and be consistent, don't mix.
 
 **Implementation note:** the use-case (`PrepareReviewContextService`) is pure Layer 3 — no FastAPI, no SQLModel, no `infrastructure` imports. Its two ports are declared in `domain/review/review_context_ports.py` and implemented by `infrastructure/db/repo_workspace_repository.py` (the `select(RepoWorkspace)...` query the webhook flow uses) and `infrastructure/db/graph_status_repository.py` (a direct `GraphSnapshot` query returning a `GraphBuildStatus` entity). Phase 1 defines `GraphReadinessService` but never instantiates it, so the Layer 2 route composes it with the latter adapter. The route translates the use-case's application-layer exceptions (`RepoNotFoundError` → 404, `GraphNotReadyError` → 425) into HTTP status codes.
+
+---
+
+## Branch Handling (Branch-Aware addendum to Phase 2)
+
+The system reviews **per-branch** code, not just the default branch. This section is the Phase 2 reference; `Branch-Aware Graph Management.md` (§0–§14) is the authoritative spec this was built against. **Trigger model is manual only (§2):** a worktree and its graph are created or updated for **exactly one reason — a user submits `POST /review` for a `(repo_id, branch)` pair.** UI branch selection has no side effect on its own.
+
+### The trigger flow (§5)
+
+`POST /review` with `body.branch` set, in order:
+1. **Validate:** exactly one of `graph_commit_hash`/`branch` — both or neither → 400.
+2. **Resolve branch → commit** live via GitHub MCP `list_branches` (`infrastructure/mcp_clients/branch_resolution.py`, async Layer 5, `scoped()`-reduced to `{list_branches}`, uses `request.app.state.mcp_client`). Unknown branch → 404 `BranchNotFoundError`; unregistered repo → 404.
+3. **Pre-flight** (`PrepareReviewContextService.execute(repo_id, resolved_commit, branch=branch)`): 404 unregistered; 425 when the per-branch row is missing OR `last_synced_commit != resolved_commit` OR the graph isn't ready.
+4. **On 425-with-branch:** the route dispatches `EnsureBranchWorktreeService.execute(...)` as a FastAPI `BackgroundTasks` task (the D-11 fix — return a `JSONResponse(425)` with `response.background = background_tasks` set; a `raise HTTPException` silently drops the queued task), then returns 425 immediately. The background task creates/updates the worktree and builds its graph; a later `POST /review` for the same (repo, branch) at the resolved commit then passes pre-flight.
+
+### When a graph actually updates (the exact rule)
+
+- **Default branch (base clone):** auto-updates on every webhook push via `SyncOnWebhookService` — `process_webhook` (`webhooks.py`) is branch-aware and only acts when `base.branch == branch` (the default-branch row). Unchanged from Phase 1.
+- **Non-default (worktree) branch:** updates **only when a user submits `POST /review` for that branch**, and only if the branch's remote tip has moved past what was last built (the pre-flight 425 triggers `EnsureBranchWorktreeService`). A push to the branch is a **webhook no-op** — it does not update that branch's graph. Because `branch_resolution` resolves the *current remote tip*, the next review of the branch detects any advance and triggers the incremental update. If the branch is already current, submitting a review reuses the existing graph (no rebuild).
+
+### Worktree lifecycle (§3)
+
+`EnsureBranchWorktreeService` (`application/repo_ingestion_service/ensure_branch_worktree.py`, sync, injected `RepoSourcePort` + `GraphBuilderPort` + `WorkspaceStore`):
+- **No row yet** (branch never requested) → `create_worktree` + full `build()` (`full_rebuild=True`).
+- **Row exists but tip advanced** → `update_worktree` + incremental `update(base=old last_synced_commit)`; if that fails (e.g. force-push made the base unreachable → CRG returns non-ready), **fall back to a full `build()`**.
+- Records `last_synced_commit` + a `GraphSnapshot`; releases the per-branch lock in a `finally`.
+
+`GitRepoSource.create_worktree`/`update_worktree` (`git_repo_source.py`): a Phase 1 clone is shallow/depth-1 (single-branch), so `create_worktree` first runs `git fetch origin <branch>:<branch>` into the base clone, then `git worktree add <path> <branch>`; `update_worktree` runs `git fetch origin <branch>:refs/remotes/origin/<branch>` then `git reset --hard origin/<branch>` and returns the new HEAD sha.
+
+### Worktree paths (§12)
+
+Siblings of the base clone, still under `WORKSPACE_ROOT` (visible to the CRG server container): base clone at `{root}/{safe_id}`, worktree at `{root}/{safe_id}__{safe_branch}` (`infrastructure/workspace/workspace_path_resolver.py` → `resolve_workspace_path`/`resolve_worktree_path`). No `CRG_DATA_DIR` override — worktree isolation is by filesystem path, verified against CRG docs before implementation (§12 "Not set" holds).
+
+### Locks (§8)
+
+`acquire_workspace_lock(workspace_root, repo_id, branch=None)` — branch scope moved to `(repo_id, branch)`; a branch lock file is `.{safe_id}_{safe_branch}.lock`; `branch=None` keeps the Phase 1 default key `.{safe_id}.lock`. `try_acquire_lock` (`timeout=0`) is a non-blocking probe the route uses to skip dispatch when another request is already building the branch.
+
+### Webhooks (§6, §9) — now branch-aware
+
+- `process_webhook(repo_id, branch, commit_sha)` is a **no-op** unless the pushed branch equals the default-branch row's branch (`base.branch != branch → return`). Non-default (worktree) branches never auto-sync via webhook.
+- `000…0` (branch deletion) is a real **dispatch** to `cleanup_deleted_branch`, not an early return: it runs `git worktree remove` + `git worktree prune` in the base clone, deletes the per-branch `RepoWorkspace` row, and **leaves `GraphSnapshot` rows** (they're commit-keyed and may back past audit rows). PR-closed is NOT a trigger.
+- New read-only `GET /repos/{repo_id:path}/branches` proxies all remote branches (404 for unregistered repos). `{repo_id:path}` is required because `repo_id` is `owner/repo` (contains a slash).
+
+### Schema migration (§7)
+
+`RepoWorkspace` is now one row **per (repo_id, branch)**: composite `UNIQUE(repo_id, branch)` + a non-unique index on `repo_id`; `branch` and `last_requested_at` columns added. `db/engine.py` runs a real **4-step rebuild** (create `repoworkspace_new` → INSERT backfill → DROP → RENAME), guarded on `branch` column presence, transactional, idempotent — **not** a guarded `ALTER TABLE`. Backfill is deterministic via `detect_branch` (`git branch --show-current` → `git symbolic-ref refs/remotes/origin/HEAD` fallback), raises rather than guessing; `last_requested_at` derived from `updated_at`. `graphsnapshot` unchanged; no new tables. `get_by_repo_id` is scoped to the default-branch row (`id.asc()`); `repo_is_registered` + `get_by_repo_id_and_branch` added to the repository.
+
+### Worktree-aware eviction (§11)
+
+`WorkspaceEvictionService` orders rows by `last_requested_at` (fallback `updated_at`), and for a worktree uses `git worktree remove --force` + `git worktree prune` (via the base clone resolved as the sibling `{root}/{sanitize_repo_id(repo_id)}`) so the base clone's `.git/worktrees` metadata is cleaned, falling back to `shutil.rmtree` for a base clone or when the base is missing. Existing `max_gb=10.0` default unchanged (no invented thresholds); wired to run once off the event loop in the lifespan.
+
+### Documented deviations (in `OPENCODE.md`)
+
+- **D-8** — `RepoSourcePort` has three new methods (`create_worktree`, `update_worktree`, `current_branch`); spec §3 names two — `current_branch` supports the migration backfill + `clone_repository` (plain read, no behavior risk).
+- **D-9** — route wires a module-level `EnsureBranchWorktreeService` instance + `BackgroundTasks` instead of a spec-named module fn; functionally equivalent composition root.
+- **D-10** — branch identity for a non-default worktree row is the requested branch string (worktree checkout fixes the commit); `last_synced_commit` records the built commit.
+- **D-11** — FastAPI drops `BackgroundTasks` on `raise HTTPException`; fixed via `JSONResponse(425)` + `response.background`. Verified against installed FastAPI source and live.
+
+---
 
 ## Agent Contracts
 
@@ -424,11 +492,11 @@ backend/src/code_review_agent/
 │
 ├── domain/                                    # existing from Phase 1, extended
 │   ├── entities/
-│   │   ├── repo_workspace.py                  # (Phase 1, unchanged)
+│   │   ├── repo_workspace.py                  # (Phase 1, EXTENDED — adds branch, last_requested_at)
 │   │   ├── graph_build_status.py              # (Phase 1, unchanged)
 │   │   └── agent_finding.py                   # NEW — AgentInput, AgentFinding, AgentOutput, ReviewResult
 │   ├── repo/
-│   │   └── repo_source_port.py                # (Phase 1, unchanged)
+│   │   └── repo_source_port.py                # (Phase 1, EXTENDED — create_worktree, update_worktree, current_branch; D-8)
 │   ├── graph/
 │   │   └── graph_builder_port.py              # (Phase 1, unchanged)
 │   └── review/                                 # NEW
@@ -437,26 +505,31 @@ backend/src/code_review_agent/
 │       └── routing_policy.py                   # NEW — plain Python/YAML-loader, no framework import
 │
 ├── application/                                # existing from Phase 1, extended
-│   ├── repo_ingestion_service/                 # (Phase 1, unchanged)
+│   ├── repo_ingestion_service/                 # (Phase 1, EXTENDED — ensure_branch_worktree.py added)
+│   │   └── ensure_branch_worktree.py           # NEW — EnsureBranchWorktreeService: create/update worktree + build/update graph (§5)
 │   ├── graph_build_service/                    # (Phase 1, unchanged)
 │   └── review_service/                         # NEW
-│       ├── prepare_review_context.py           # NEW — pure use-case (no framework/SQL): readiness check (425) + local_path resolution from DB via injected ports
+│       ├── prepare_review_context.py           # NEW — pure use-case (no framework/SQL): readiness check (425) + local_path resolution from DB via injected ports; branch kwarg added
 │       ├── errors.py                           # NEW — RepoNotFoundError, GraphNotReadyError, UnknownRequestTypeError (app-layer, no FastAPI)
 │       └── run_review.py                       # routes via routing_policy -> invokes ReviewOrchestratorPort
 │
 ├── infrastructure/                             # existing from Phase 1, extended
 │   ├── config.py                               # (Phase 1, extended with review_model, review_max_tokens, review_timeout, github_pat, context7_api_key, atlassian settings; extra="ignore")
-│   ├── repo_source/                            # (Phase 1, unchanged)
+│   ├── repo_source/                            # (Phase 1, EXTENDED — create_worktree/update_worktree in git_repo_source.py)
 │   ├── graph_builder/                          # (Phase 1, unchanged)
 │   ├── graph_service/                          # (Phase 1, unchanged)
-│   ├── workspace/                              # (Phase 1, unchanged)
+│   ├── workspace/
+│   │   ├── workspace_path_resolver.py          # NEW — resolve_workspace_path + resolve_worktree_path (§12)
+│   │   ├── workspace_lock.py                   # (Phase 1, EXTENDED — branch=None param, per-branch lock key, try_acquire_lock)
+│   │   └── workspace_eviction_service.py       # (Phase 1, EXTENDED — worktree-aware LRU, git worktree remove; §11)
 │   ├── db/
-│   │   ├── models.py                           # (Phase 1 tables unchanged) + NEW ReviewSession, AgentExecution
-│   │   ├── engine.py                           # (Phase 1, EXTENDED — WAL pragma added, see SQLite note below)
-│   │   ├── repo_workspace_repository.py        # NEW — SQLModelRepoWorkspaceRepository, implements RepoWorkspaceQueryPort
+│   │   ├── models.py                           # (Phase 1 tables EXTENDED — RepoWorkspace per-branch) + NEW ReviewSession, AgentExecution
+│   │   ├── engine.py                           # (Phase 1, EXTENDED — WAL pragma + RepoWorkspace 4-step rebuild migration)
+│   │   ├── repo_workspace_repository.py        # NEW — SQLModelRepoWorkspaceRepository, implements RepoWorkspaceQueryPort (get_by_repo_id_and_branch, repo_is_registered)
 │   │   └── graph_status_repository.py          # NEW — SQLModelGraphStatusQuery, feeds GraphReadinessService
 │   ├── mcp_clients/                            # NEW
-│   │   └── mcp_client_factory.py               # builds the shared MultiServerMCPClient
+│   │   ├── mcp_client_factory.py               # builds the shared MultiServerMCPClient
+│   │   └── branch_resolution.py                # NEW — async list_branches proxy (scoped to {list_branches}) + resolve_branch_to_commit (§4)
 │   ├── agents_runtime/                         # NEW
 │   │   ├── orchestrator_runtime.py             # one create_deep_agent root (orchestrator + aggregator); tolerant report parsing + bounded retry
 │   │   ├── harness_profile.py                  # safety HarnessProfile: strips 8 built-in tools, disables general-purpose subagent
@@ -484,8 +557,8 @@ backend/src/code_review_agent/
 │   └── api/
 │       ├── models.py                           # NEW — ReviewRequest (Pydantic), Layer 2, not domain
 │       └── routes/
-│           ├── webhooks.py                     # (Phase 1, unchanged)
-│           └── review.py                       # NEW — POST /review; runs the pre-flight service (404/425) first, then dispatches agents
+│           ├── webhooks.py                     # (Phase 1, EXTENDED — branch-aware: default-branch-only sync, 000...0 cleanup, GET /repos/{repo_id}/branches)
+│           └── review.py                       # NEW — POST /review; runs the pre-flight service (404/425) first, then dispatches agents; branch path dispatches EnsureBranchWorktreeService (D-11 JSONResponse 425)
 │
 ├── scripts/
 │   ├── run_crg_server.sh                       # (Phase 1, unchanged)
@@ -494,7 +567,7 @@ backend/src/code_review_agent/
 └── docker-compose.yaml                         # extended: add the mcp-atlassian service alongside existing volumes
 ```
 
-Additive wiring beyond the tree: `main.py`'s existing lifespan now also runs a CRG connectivity check (`CRGServerManager.ensure_connected(timeout=10)` — a check, not a launcher) and builds the shared client once (`app.state.mcp_client = build_mcp_client()`), and the review router is included under `/api/v1`. All strictly additive — no Phase 1 logic was modified. (The Phase 1 do-not-modify allowance is `config.py`, `db/models.py`, `db/engine.py`; the `main.py` wiring is this phase's documented, additive exception.)
+Additive wiring beyond the tree: `main.py`'s existing lifespan now also runs a CRG connectivity check (`CRGServerManager.ensure_connected(timeout=10)` — a check, not a launcher) and builds the shared client once (`app.state.mcp_client = build_mcp_client()`), runs the worktree-aware eviction once off the event loop (§11), and the review router is included under `/api/v1`. All strictly additive — no Phase 1 logic was modified. (The Phase 1 do-not-modify allowance is `config.py`, `db/models.py`, `db/engine.py`; the `main.py` wiring is this phase's documented, additive exception.)
 
 **New DB tables** — same SQLite file as Phase 1, same `SQLModel` pattern. Do not stand up Postgres yet.
 
@@ -614,6 +687,11 @@ Items below are marked against the *implemented* state (verified in code and liv
 - [x] Event schema entries are logged (stdout + `logs/review_events.log`) for thinking/tool_call/tool_result/final plus the extended `tool_call_attempt`/`invalid_tool_call`/`llm_call` — no UI required.
 - [x] `mcp-atlassian` runs via `uvx mcp-atlassian --transport streamable-http --port 9000`, not the official Rovo server.
 - [x] Domain layer has zero imports of `deepagents`, `langchain_mcp_adapters`, `pydantic`, or `fastapi`.
-- [x] Nothing from Phase 1's folder tree was deleted or modified except `config.py`, `db/models.py`, and `db/engine.py` (all extended, not replaced), plus the strictly-additive `main.py` wiring (review-router include, `app.state.mcp_client`, CRG connectivity check).
+- [x] **Branch Handling (Branch-Aware addendum):** `POST /review` accepts exactly one of `graph_commit_hash`/`branch` (400 on both/neither), resolves an unknown `branch` to 404 `BranchNotFoundError`, returns 425 on an unready per-branch graph, and dispatches `EnsureBranchWorktreeService` via `BackgroundTasks` using the D-11 `JSONResponse(425)` + `response.background` fix (a `raise HTTPException` drops the queued build). Verified live end to end (see `OPENCODE.md`).
+- [x] **Worktree lifecycle (§3):** `EnsureBranchWorktreeService` creates the worktree (fetch-then-`git worktree add` for the shallow-clone refspec) with a full `build()` on first request, and fast-forwards via `update_worktree` (fetch + `reset --hard origin/<branch>`) with an incremental `update(base=last_synced_commit)` on later requests, falling back to a full rebuild on force-push base-unreachable; records `last_synced_commit` + `GraphSnapshot` and releases the per-branch lock in a `finally`.
+- [x] **Webhooks branch-aware (§6/§9):** `process_webhook` is a no-op for non-default (worktree) branch pushes (only the default-branch row syncs); `000…0` is a real dispatch to `cleanup_deleted_branch` (`git worktree remove` + `prune` + row delete, `GraphSnapshot` left intact, no `pull_request` trigger); read-only `GET /repos/{repo_id:path}/branches` proxies all remote branches (404 unregistered).
+- [x] **Schema migration (§7):** `RepoWorkspace` is per-`(repo_id, branch)` with composite `UNIQUE(repo_id, branch)` + non-unique `repo_id` index, migrated via a real 4-step rebuild (create/insert/drop/rename), guarded on `branch` column presence, transactional and idempotent — not a guarded `ALTER TABLE`; branch backfill is deterministic (`detect_branch`) and raises rather than guessing. Migration verified against the real dev DB.
+- [x] **Worktree-aware eviction (§11):** `WorkspaceEvictionService` orders by `last_requested_at` (fallback `updated_at`), resolves the base clone as the sibling `{root}/{sanitize_repo_id(repo_id)}`, and uses `git worktree remove --force` + `prune` for worktrees (falling back to `rmtree` for base clones), `max_gb=10.0` unchanged; wired to run off the event loop in the lifespan. Covered by focused unit tests.
+- [x] Nothing from Phase 1's folder tree was deleted; Phase 1 files were only extended where the addendum allows (`config.py`, `db/models.py`, `db/engine.py`) plus the branch-aware additions (`repo_source_port.py`/`git_repo_source.py`, `workspace_lock.py`, `workspace_eviction_service.py`, `webhooks.py`) and the strictly-additive `main.py` wiring (review-router include, `app.state.mcp_client`, CRG connectivity check, startup eviction).
 - [x] No LangMem, no Context Agent, no conversation persistence tables, no frontend, no streaming.
-- [x] **Phase 3 sign-off still pending** — reviewer final pass was 29/30; the single minor FAIL (Compliance's Context7 grant) is FIXED.
+- [x] **Phase 3 sign-off still pending** — reviewer final pass was 29/30; the single minor FAIL (Compliance's Context7 grant) is FIXED. The Branch-Aware addendum's own review (D-8/D-9/D-10/D-11 + one eviction defect E.15) is resolved — see `OPENCODE.md`.

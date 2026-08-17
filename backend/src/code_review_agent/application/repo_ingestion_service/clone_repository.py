@@ -33,6 +33,7 @@ class CloneRepositoryService:
 
         workspace = RepoWorkspace(
             repo_id=repo_id,
+            branch=self._repo_source.current_branch(local_path),
             local_path=local_path,
             last_synced_commit=commit_sha,
         )

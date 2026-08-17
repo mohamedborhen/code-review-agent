@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from contextlib import asynccontextmanager
@@ -6,13 +7,16 @@ from fastapi import FastAPI
 
 from infrastructure.api.routes.review import router as review_router
 from infrastructure.api.routes.webhooks import router as webhook_router
+from infrastructure.config import settings
 from infrastructure.db.engine import init_db
 from infrastructure.graph_service.crg_server_manager import CRGServerManager
 from infrastructure.mcp_clients.mcp_client_factory import build_mcp_client
+from infrastructure.workspace.workspace_eviction_service import WorkspaceEvictionService
 
 logger = logging.getLogger(__name__)
 
 crg_manager = CRGServerManager()
+eviction_service = WorkspaceEvictionService(settings.workspace_root)
 
 
 @asynccontextmanager
@@ -23,6 +27,12 @@ async def lifespan(app: FastAPI):
     logger.info("CRG server is reachable")
     app.state.mcp_client = build_mcp_client()
     logger.info("Shared MultiServerMCPClient built on app.state")
+    # Branch-aware worktree eviction (§11): run off the event loop on startup so
+    # the app comes up promptly; it evicts LRU worktrees only when over budget.
+    try:
+        await asyncio.to_thread(eviction_service.evict_if_needed)
+    except Exception as e:  # never block startup on eviction failure
+        logger.warning("Workspace eviction on startup failed: %s", e)
     yield
 
 

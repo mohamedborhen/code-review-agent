@@ -25,10 +25,14 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlmodel import Session
 
 from application.graph_build_service.graph_readiness_service import GraphReadinessService
+from application.repo_ingestion_service.ensure_branch_worktree import (
+    EnsureBranchWorktreeService,
+)
 from application.review_service.errors import (
     GraphNotReadyError,
     RepoNotFoundError,
@@ -48,6 +52,13 @@ from infrastructure.db.graph_status_repository import SQLModelGraphStatusQuery
 from infrastructure.db.models import AgentExecution, ReviewSession
 from infrastructure.db.repo_workspace_repository import SQLModelRepoWorkspaceRepository
 from infrastructure.event_bus.log_event_bus import log_event
+from infrastructure.graph_builder.crg_mcp_adapter import CRGMcpAdapter
+from infrastructure.mcp_clients.branch_resolution import (
+    BranchNotFoundError,
+    resolve_branch_to_commit,
+)
+from infrastructure.repo_source.git_repo_source import GitRepoSource
+from infrastructure.workspace.workspace_lock import acquire_workspace_lock, try_acquire_lock
 
 logger = logging.getLogger(__name__)
 
@@ -61,24 +72,61 @@ _prepare_context = PrepareReviewContextService(
     GraphReadinessService(SQLModelGraphStatusQuery()),
 )
 
+_ensure_worktree = EnsureBranchWorktreeService(
+    GitRepoSource(),
+    CRGMcpAdapter(settings.crg_server_url),
+    SQLModelRepoWorkspaceRepository(),
+    settings.workspace_root,
+    acquire_workspace_lock,
+)
+
 
 @router.post("/review")
-async def review(request: Request, body: ReviewRequest) -> dict:
+async def review(
+    request: Request, body: ReviewRequest, background_tasks: BackgroundTasks
+) -> dict:
     if agents_for_request(body.request_type) is None:
         raise HTTPException(status_code=400, detail=f"Unknown request_type: {body.request_type}")
 
+    _validate_branch_or_hash(body)
+
+    if body.branch is not None:
+        owner, _, repo = body.repo_id.partition("/")
+        try:
+            resolved_commit = await resolve_branch_to_commit(
+                request.app.state.mcp_client, owner, repo, body.branch
+            )
+        except BranchNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    else:
+        resolved_commit = body.graph_commit_hash
+
     try:
-        repo_root = _prepare_context.execute(body.repo_id, body.graph_commit_hash)
+        repo_root = _prepare_context.execute(
+            body.repo_id, resolved_commit, branch=body.branch
+        )
     except RepoNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except GraphNotReadyError as exc:
-        raise HTTPException(status_code=425, detail="Graph not ready for this commit yet") from exc
+        if body.branch is not None:
+            if try_acquire_lock(settings.workspace_root, body.repo_id, body.branch):
+                background_tasks.add_task(
+                    _ensure_worktree.execute, body.repo_id, body.branch, resolved_commit
+                )
+        # NOTE: return a Response (not raise HTTPException) so the background
+        # worktree build actually runs — FastAPI attaches BackgroundTasks only
+        # on the normal return path; raising discards them silently.
+        response = JSONResponse(
+            status_code=425, content={"detail": "Graph not ready for this commit yet"}
+        )
+        response.background = background_tasks
+        return response
 
-    session_id = await asyncio.to_thread(_create_review_session, body)
+    session_id = await asyncio.to_thread(_create_review_session, body, resolved_commit)
 
     review_input = AgentInput(
         repo_id=body.repo_id,
-        graph_commit_hash=body.graph_commit_hash,
+        graph_commit_hash=resolved_commit,
         request_type=body.request_type,
         diff_content=body.diff_content,
         repo_root=repo_root,
@@ -114,11 +162,20 @@ async def review(request: Request, body: ReviewRequest) -> dict:
     }
 
 
-def _create_review_session(body: ReviewRequest) -> int:
+def _validate_branch_or_hash(body: ReviewRequest) -> None:
+    supplied = (body.branch is not None, body.graph_commit_hash is not None)
+    if sum(supplied) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of 'branch' or 'graph_commit_hash'",
+        )
+
+
+def _create_review_session(body: ReviewRequest, resolved_commit: str) -> int:
     with Session(engine) as session:
         row = ReviewSession(
             repo_id=body.repo_id,
-            graph_commit_hash=body.graph_commit_hash,
+            graph_commit_hash=resolved_commit,
             request_type=body.request_type,
             model=settings.review_model,
             status="running",

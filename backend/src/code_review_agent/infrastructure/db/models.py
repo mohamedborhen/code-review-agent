@@ -1,13 +1,17 @@
 from datetime import datetime, timezone
 
-from sqlmodel import Field, SQLModel
+from sqlmodel import Field, SQLModel, UniqueConstraint
 
 
 class RepoWorkspace(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("repo_id", "branch"),)
+
     id: int | None = Field(default=None, primary_key=True)
-    repo_id: str = Field(unique=True, index=True)
+    repo_id: str = Field(index=True)
+    branch: str
     local_path: str
     last_synced_commit: str | None = None
+    last_requested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
