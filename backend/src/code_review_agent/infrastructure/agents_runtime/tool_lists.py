@@ -77,6 +77,12 @@ ATLASSIAN_FIX_SUGGESTION: Final[set[str]] = {
     "confluence_get_page",
 }
 
+# Conversation FastMCP (Phase 3): the Context Agent is granted exactly this
+# single read-only tool — never a wildcard, never a write tool (PHASE_3.md §5/§8).
+CONVERSATION: Final[dict[str, set[str]]] = {
+    "context_agent": {"search_messages"},
+}
+
 # Per-agent tool scoping. A value of None means "all tools from that server"
 # (used only for Context7, which is read-only documentation lookup by design).
 AGENT_TOOL_PLAN: Final[dict[str, dict[str, set[str] | None]]] = {

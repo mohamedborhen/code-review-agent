@@ -1,7 +1,7 @@
-"""Shared MultiServerMCPClient for the four review MCP servers.
+"""Shared MultiServerMCPClient for the five review MCP servers.
 
 Constructed ONCE in FastAPI's lifespan (stored on app.state.mcp_client) — never
-per-request. Four HTTP connection setups per POST /review call would be real,
+per-request. Five HTTP connection setups per POST /review call would be real,
 avoidable latency.
 
 Safety notes (do not relax):
@@ -11,6 +11,9 @@ Safety notes (do not relax):
 - ``github`` enforces read-only server-side via X-MCP-Readonly plus a scoped
   X-MCP-Toolsets header; client-side per-agent tool filtering is the second,
   deliberately redundant layer.
+- ``conversation`` (Phase 3) is the Conversation FastMCP server — read-only by
+  construction (single search_messages tool) and bound to 127.0.0.1; never
+  expose a write tool there (PHASE_3.md §5/§8).
 - ``tool_name_prefix`` stays at its default (False). Do not add prefix-stripping
   or fuzzy tool-name-matching to scoped(); CRG's own tool names already contain
   underscores as part of the real name, so naive stripping corrupts them.
@@ -52,6 +55,10 @@ def build_mcp_client() -> MultiServerMCPClient:
                     if settings.context7_api_key
                     else {}
                 ),
+            },
+            "conversation": {
+                "transport": "streamable_http",
+                "url": settings.conversation_mcp_url,
             },
         }
     )

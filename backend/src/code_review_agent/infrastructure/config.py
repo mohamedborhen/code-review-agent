@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     confluence_username: str | None = None
     confluence_api_token: str | None = None
 
+    # --- Phase 3 additions ---
+    # Conversation FastMCP server (Phase 3): internal streamable-http endpoint
+    # bound to 127.0.0.1. This is the 5th server registered in the shared
+    # MultiServerMCPClient; docker-compose overrides it to the containerized
+    # URL, so never hardcode 127.0.0.1 here.
+    conversation_mcp_url: str = "http://127.0.0.1:9001/mcp"
+
     @model_validator(mode="after")
     def resolve_relative_paths(self) -> "Settings":
         if not os.path.isabs(self.workspace_root):

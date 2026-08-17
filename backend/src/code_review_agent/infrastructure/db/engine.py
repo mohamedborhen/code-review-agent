@@ -16,6 +16,12 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
     cursor.execute("PRAGMA busy_timeout=5000;")
+    # Enforce FK constraints on every connection (Phase 3 DoD §10: "FK
+    # constraints active"). SQLite ships with foreign_keys OFF by default, so
+    # ON DELETE CASCADE on Message/ToolCall/MemorySummary never fires without
+    # this — orphan rows would be possible. Phase 1/2 tables have no FKs that
+    # this pragma could break.
+    cursor.execute("PRAGMA foreign_keys=ON;")
     cursor.close()
 
 
@@ -25,6 +31,8 @@ def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     _add_model_columns()
     _rebuild_repoworkspace()
+    _rebuild_agentexecution()
+    _create_fts_index()
 
 
 def _add_model_columns() -> None:
@@ -143,3 +151,101 @@ def _rebuild_repoworkspace() -> None:
         conn.exec_driver_sql("DROP TABLE repoworkspace")
         conn.exec_driver_sql("ALTER TABLE repoworkspace_new RENAME TO repoworkspace")
         conn.exec_driver_sql("CREATE INDEX ix_repoworkspace_repo_id ON repoworkspace (repo_id)")
+
+
+def _rebuild_agentexecution() -> None:
+    """4-step SQLite table rebuild: ``AgentExecution`` gets a nullable
+    ``review_session_id`` and an optional ``conversation_id`` FK.
+
+    ``create_all`` only creates missing tables and ``_add_model_columns`` only
+    adds columns — neither can relax ``review_session_id NOT NULL`` or add the
+    ``conversation_id`` FK. SQLite supports no constraint changes via ALTER
+    TABLE, so the standard 4-step rebuild (create/insert/drop/rename) runs
+    inside one transaction, following the established ``_rebuild_repoworkspace``
+    pattern (PHASE_3.md §2.3).
+
+    Every existing column is carried over so no audit data is lost. A fresh DB
+    already has the new shape (created by ``create_all`` above), so the rebuild
+    is skipped when ``conversation_id`` is present.
+    """
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(agentexecution)")}
+        if "conversation_id" in cols:
+            return
+
+        rows = conn.exec_driver_sql(
+            "SELECT id, review_session_id, agent_name, duration_ms, confidence, "
+            "model, result, created_at FROM agentexecution"
+        ).fetchall()
+
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE agentexecution_temp (
+                id INTEGER NOT NULL,
+                review_session_id INTEGER NULL REFERENCES ReviewSession(id),
+                conversation_id INTEGER NULL REFERENCES Conversation(id),
+                agent_name VARCHAR NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                confidence FLOAT,
+                model VARCHAR,
+                result VARCHAR NOT NULL,
+                created_at DATETIME NOT NULL,
+                PRIMARY KEY (id)
+            )
+            """
+        )
+
+        for row in rows:
+            conn.exec_driver_sql(
+                "INSERT INTO agentexecution_temp "
+                "(id, review_session_id, conversation_id, agent_name, duration_ms, "
+                "confidence, model, result, created_at) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                tuple(row),
+            )
+
+        conn.exec_driver_sql("DROP TABLE agentexecution")
+        conn.exec_driver_sql("ALTER TABLE agentexecution_temp RENAME TO agentexecution")
+
+
+def _create_fts_index() -> None:
+    """FTS5 virtual table + sync triggers for Message.content.
+
+    Documented startup-wiring exception (PHASE_3.md §1, AGENTS.md): raw DDL runs
+    inside ``init_db()`` because ``message_fts`` is a virtual table SQLModel's
+    ``create_all`` cannot express. ``porter unicode61 tokenchars '_-.'`` keeps
+    identifiers like ``CLIP-4`` / ``snake_case_file`` unshredded.
+    """
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+                content,
+                content='Message',
+                content_rowid='id',
+                tokenize = "porter unicode61 tokenchars '_-.'"
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS message_ai AFTER INSERT ON Message BEGIN
+                INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
+            END
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS message_ad AFTER DELETE ON Message BEGIN
+                INSERT INTO message_fts(message_fts, rowid, content) VALUES('delete', old.id, old.content);
+            END
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS message_au AFTER UPDATE ON Message BEGIN
+                INSERT INTO message_fts(message_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
+            END
+            """
+        )

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from infrastructure.api.routes.conversation import router as conversation_router
 from infrastructure.api.routes.review import router as review_router
 from infrastructure.api.routes.webhooks import router as webhook_router
 from infrastructure.config import settings
@@ -39,3 +40,4 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Code Review Agent", version="0.1.0", lifespan=lifespan)
 app.include_router(webhook_router, prefix="/api/v1")
 app.include_router(review_router, prefix="/api/v1")
+app.include_router(conversation_router, prefix="/api/v1")

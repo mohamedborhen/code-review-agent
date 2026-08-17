@@ -10,6 +10,7 @@ services:
     environment:
       - CRG_SERVER_URL=http://crg-server:5555/mcp
       - ATLASSIAN_MCP_URL=http://mcp-atlassian:9000/mcp
+      - CONVERSATION_MCP_URL=http://conversation-server:9001/mcp
     volumes:
       - workspace_data:/app/data
     depends_on:
@@ -53,6 +54,22 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    restart: unless-stopped
+
+  conversation-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m infrastructure.mcp_clients.servers.conversation_server
+    env_file:
+      - .env
+    environment:
+      - CONVERSATION_MCP_URL=http://127.0.0.1:9001/mcp
+      - CONVERSATION_SERVER_HOST=0.0.0.0
+    volumes:
+      - workspace_data:/app/data
+    depends_on:
+      - code-review-agent
     restart: unless-stopped
 
 volumes:
