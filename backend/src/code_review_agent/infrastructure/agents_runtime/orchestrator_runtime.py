@@ -114,7 +114,6 @@ class OrchestratorRuntime:
                 subagent_specs.append(spec)
 
         system_prompt = load_prompt("orchestrator") + "\n\n" + load_prompt("aggregator")
-        user_message = _build_user_message(review_input, agent_names)
 
         root_middleware = [
             RootTimingMiddleware(self.capture),
@@ -133,6 +132,15 @@ class OrchestratorRuntime:
         # filesystem/execute built-ins.
         root_tools = await _build_root_tools(
             review_input, self._mcp_client, self._review_session_id, self.capture
+        )
+
+        # The conversation-context prompt block must match what the root agent
+        # was actually granted: only declare context AVAILABLE when the tool was
+        # successfully built (server up / registered). On the degraded path
+        # (server down) the tool is withheld, so the block is omitted too —
+        # otherwise the model is told it has a tool it does not (finding F2).
+        user_message = _build_user_message(
+            review_input, agent_names, context_available=root_tools is not None
         )
 
         agent = create_deep_agent(
@@ -187,7 +195,9 @@ async def _build_root_tools(
     return [audited_context_tool]
 
 
-def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str:
+def _build_user_message(
+    review_input: AgentInput, agent_names: list[str], context_available: bool = True
+) -> str:
     if review_input.request_type == "any_question":
         pool = ", ".join(agent_names) if agent_names else "(none)"
         lines = [
@@ -253,7 +263,7 @@ def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str
         )
         text = "\n".join(lines)
 
-    if review_input.conversation_id is not None:
+    if review_input.conversation_id is not None and context_available:
         text += "\n\n" + _conversation_context_block(review_input)
     return text
 

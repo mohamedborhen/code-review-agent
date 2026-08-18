@@ -15,6 +15,16 @@
 # (our Cloud API tokens included), NOT just mTLS. We keep it true because our
 # client sends no per-request Atlassian headers (creds live in this process's
 # env). Revisit only if a future phase moves to per-user auth headers.
+#
+# THIS ENV IS LOAD-BEARING — the 2026-08-18 E2E incident (session 115):
+# launching `uvx mcp-atlassian --transport streamable-http --port 9000` WITHOUT
+# these exports + `--env-file .env` made UserTokenMiddleware 401 every MCP
+# request, so `MultiServerMCPClient.get_tools(server_name="atlassian")` raised
+# an ExceptionGroup and `POST /review` returned 500 ("unhandled errors in a
+# TaskGroup"). The server banner printed "FastMCP 3.4.7" (the framework
+# version), which is NOT the mcp-atlassian version — the package is pinned at
+# 0.23.0 below. Always launch via this script (or the compose service); a bare
+# `uvx` invocation is not equivalent.
 set -euo pipefail
 
 # Server-side security boundaries (mirror the GitHub X-MCP-Readonly enforcement).
@@ -29,4 +39,4 @@ export ALLOW_GLOBAL_CRED_FALLBACK=true
 export TOOLSETS=all
 export ENABLED_TOOLS="jira_get_issue,confluence_search,confluence_get_page"
 
-exec uvx mcp-atlassian --env-file .env -v --transport streamable-http --port 9000
+exec uvx mcp-atlassian@0.23.0 --env-file .env -v --transport streamable-http --port 9000

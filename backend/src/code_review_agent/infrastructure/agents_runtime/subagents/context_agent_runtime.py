@@ -10,6 +10,7 @@ conversation retrieval component (no shared/private memory, no summarization).
 
 import asyncio
 import json
+import logging
 import time
 
 from langchain_core.tools import StructuredTool
@@ -17,6 +18,8 @@ from pydantic import BaseModel, ConfigDict
 
 from infrastructure.agents_runtime.tool_scoping import _strip_null_unions, scope_agent_tools
 from infrastructure.mcp_clients.mcp_client_factory import scoped
+
+logger = logging.getLogger(__name__)
 
 
 class ContextSearchQuery(BaseModel):
@@ -83,7 +86,14 @@ async def get_audited_context_tool(
     Returns None when the tool is unavailable (server down / not registered) so
     the caller can skip recall without failing the review.
     """
-    tools = await scope_agent_tools(mcp_client, "context_agent", store)
+    try:
+        tools = await scope_agent_tools(mcp_client, "context_agent", store)
+    except Exception as exc:
+        logger.warning(
+            "Context recall skipped: scope_agent_tools failed (%s)",
+            type(exc).__name__,
+        )
+        return None
     if not tools:
         return None
     tool = tools[0]

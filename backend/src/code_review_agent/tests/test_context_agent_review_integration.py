@@ -18,6 +18,8 @@ Covers the build contract without a live LLM:
   15. LLM-visible args_schema exposes ONLY query/limit/exclude_message_id
   16. E2E: seeded fact -> review cites it (live, run separately)
   17. full suite green (pytest)
+  18. get_tools raising (server down) -> build returns None, review proceeds
+  19. context_available=False omits the AVAILABLE prompt block (tool withheld)
 
 Unit-testable subset runs here; live E2E is exercised via the running servers.
 """
@@ -82,6 +84,13 @@ class _FakeMCPClient:
         return self._tools.get(server_name, [])
 
 
+class _UnavailableMCPClient:
+    """Mimics MultiServerMCPClient.get_tools raising (down / not registered)."""
+
+    async def get_tools(self, server_name: str) -> list:
+        raise ValueError(f"Couldn't find a server with name '{server_name}'")
+
+
 class _RecordingAudit:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
@@ -141,6 +150,16 @@ class BuildRootToolsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(tools)
 
+    def test_tool_server_down_returns_none(self):
+        # get_tools raises (real failure mode) -> recall skipped, no crash.
+        client = _UnavailableMCPClient()
+        tools = asyncio.run(
+            _build_root_tools(
+                _agent_input(conversation_id=7, user_id="alice"), client, 42, CaptureStore()
+            )
+        )
+        self.assertIsNone(tools)
+
     def test_plan_entry_exactly_search_messages(self):
         self.assertEqual(
             AGENT_TOOL_PLAN["context_agent"], {"conversation": {"search_messages"}}
@@ -169,6 +188,19 @@ class BuildUserMessageTest(unittest.TestCase):
         self.assertNotIn("repo_id: acme/repo", text)
         self.assertIn("pre-scoped", text)
         self.assertIn("do not pass conversation_id", text)
+
+    def test_context_available_false_omits_block(self):
+        # Degraded path (F2): conversation_id present but the tool was not
+        # granted (server down) -> the AVAILABLE block must be omitted, so the
+        # model is never told it has a tool it does not.
+        text = _build_user_message(
+            _agent_input(conversation_id=7, user_id="alice"),
+            ["security"],
+            context_available=False,
+        )
+        self.assertNotIn("Historical conversation context is AVAILABLE", text)
+        self.assertNotIn("search_messages", text)
+        self.assertNotIn("pre-scoped", text)
 
 
 class AuditedContextToolTest(unittest.IsolatedAsyncioTestCase):
