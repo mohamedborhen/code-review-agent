@@ -51,6 +51,7 @@ These come directly from the existing Phase 1/2 architecture and the Phase 3 pre
 | Conversation FastMCP = 5th server in shared `MultiServerMCPClient` | `infrastructure/mcp_clients/mcp_client_factory.py:59-62` | ✅ |
 | No second/per-request MCP client | Single `build_mcp_client()` in `main.py` lifespan → `app.state.mcp_client` | ✅ |
 | Static identity transport (typed args, not headers) | `search_messages(conversation_id, user_id, repo_id, ...)` | ✅ |
+| Identity closure-bound for the LLM (`extra="forbid"` args_schema) | `ContextSearchQuery` in `context_agent_runtime.py` (§1, §9.5) | ✅ |
 | Explicit tool list for Context Agent | `tool_lists.py`: `context_agent → {"conversation": {"search_messages"}}` | ✅ |
 | Context Agent read-only | Only `search_messages` (SELECT-only) exists anywhere in its path | ✅ |
 | No `execute_sql` tool | Conversation server exposes exactly one `@mcp.tool()` | ✅ |
@@ -163,6 +164,8 @@ AgentInput (now carries conversation_id + user_id)
 Review Orchestrator / DeepAgents (run_review)
   │  ├─ root tools: conversation_id present → [audited search_messages tool]
   │  │              conversation_id absent → None (Phase 2 path)
+  │  │              server down / tool absent → None (recall skipped,
+  │  │                 AVAILABLE prompt block withheld too)
   │  ├─ classify/interpret request
   │  └─ LLM decides whether historical context is useful
   │        ├─ NO ─────────────────────────────► normal Phase 2 delegation
@@ -470,7 +473,7 @@ Context retrieval uses the existing `ReviewSession` / `AgentExecution` audit pat
 }
 ```
 
-`status` literal values: `"ok"` on success (note: **`"ok"`, not `"success"`**), `"not_found"` / `"invalid_query"` on those error responses, `"invalid_response"` on unparsable payloads, `"error:<ExceptionType>"` when the tool call itself raises.
+`status` literal values: `"ok"` on success (note: **`"ok"`, not `"success"`**), `"not_found"` / `"invalid_query"` on those error responses, `"invalid_response"` on unparsable payloads. `"error:<ExceptionType>"` is recorded only by the turn flow's `_recall_context` failure path (a raised transport/session exception). The audited-tool path never reaches it: `handle_tool_error` captures a failing inner call as a `ToolMessage`, whose content then fails JSON parsing and records `"invalid_response"` instead (§9.4).
 
 ### 9.3 Strict privacy rule
 
@@ -482,6 +485,14 @@ Audit records must never contain: message content, snippets, full retrieved evid
 - Failed context calls are audited (both the turn flow's `_recall_context` failure path and the tool-error path).
 - `review_session_id` is populated for review-triggered retrieval; `None` for standalone turns.
 - No-recall reviews produce **no** context audit row (no invocation occurred).
+
+### 9.5 Identity security
+
+The codebase has no auth middleware: identity is caller-supplied in the request body and transported as explicit typed arguments to `search_messages` (§1 Static Client Identity Transport, §8.2). The context-retrieval path never trusts an LLM-controlled identity value:
+
+- **Turn flow** (`search_conversation_context`): identity is passed as explicit typed parameters — never derived from MCP headers or static client config.
+- **Orchestrator audited tool** (`get_audited_context_tool`, §10.2): `conversation_id`/`user_id`/`repo_id` are closure-bound at construction time, before the LLM ever sees the tool. The LLM-visible `args_schema` is the narrow `ContextSearchQuery` model (`extra="forbid"`, exposing ONLY `query`/`limit`/`exclude_message_id`), so a hostile/injected call that tries to smuggle identity keys is REJECTED at schema validation (pydantic `ValidationError`) — never silently overridden downstream.
+- **Server side**: the Conversation MCP re-checks `conversation_id + user_id + repo_id` on every call (§8.2), so the authorization boundary holds even if a caller reached `search_messages` directly.
 
 ---
 
@@ -516,7 +527,7 @@ Builds the tool granted to the orchestrator root agent:
 1. `scope_agent_tools(mcp_client, "context_agent", store)` — the event-wrapped (timeline-captured) scoped `search_messages` tool.
 2. Wraps it with an audit wrapper that, per invocation: times the call, parses the JSON payload for `results_count`/`status`, and records one `AgentExecution` row through the injected `ConversationAuditPort` (query/counts/latency/status only — never content).
 3. **Identity is closure-bound at construction time.** `conversation_id`/`user_id`/`repo_id` are injected server-side into every invocation; the LLM-visible `args_schema` is the narrow `ContextSearchQuery` model exposing ONLY `query`/`limit`/`exclude_message_id` with `extra="forbid"`. A hostile call that tries to supply identity keys is rejected at schema validation before the underlying tool runs — the LLM cannot choose, guess, or exfiltrate a scope.
-4. Returns `None` when the tool is unavailable so the caller can skip recall without failing the review.
+4. Returns `None` when the tool is unavailable so the caller can skip recall without failing the review. A raised exception during tool build (Conversation server down / not registered — `scope_agent_tools` → `get_tools`) is caught, logged with its exception type (so unexpected build failures stay distinguishable from MCP-server unavailability), and converted to `None`.
 
 ### 10.3 `search_conversation_context(mcp_client, *, conversation_id, user_id, repo_id, query, limit, exclude_message_id)`
 
@@ -554,7 +565,7 @@ When `conversation_id` is present, the orchestrator's user message gains a "Hist
 - retain the `message_id` of every hit relied on;
 - when recalled messages contradict, prefer the **most recent** one.
 
-The block is absent when no conversation is supplied (Phase 2 prompt byte-for-byte).
+The block is absent when no conversation is supplied (Phase 2 prompt byte-for-byte). It is also omitted on the degraded path: when `conversation_id` is present but the tool could not be built (Conversation server down / not registered), `run_review` passes `context_available=False` and the block is withheld, so the model is never told it has a `search_messages` tool it was not granted.
 
 ### 11.3 Orchestrator prompt (`prompts/orchestrator.md`)
 
@@ -737,7 +748,7 @@ conversation-server:
 | Invalid search query | `invalid_query` (overlong or FTS5 `OperationalError`). Never crashes the server; never interpreted as an empty historical result. |
 | Context retrieval failure | Audited with failure status; the turn/review continues per existing error-handling policy. Never converts an error into a successful empty result; never invents evidence. |
 | Conflicting historical messages | FTS5 score is not truth — the most recent message by `created_at`/`id` takes precedence (recency wins). |
-| Conversation server down / tool absent | `get_search_messages_tool` / `get_audited_context_tool` return `None`; recall is skipped, review proceeds. |
+| Conversation server down / tool absent | Orchestrator path: `get_audited_context_tool` catches the raised `get_tools` exception, logs it, and returns `None` — recall skipped, review proceeds (§10.2, §11.1). Turn flow: `get_search_messages_tool` propagates the raise, which `_recall_context` catches and audits as `error:<ExceptionType>`; the turn continues without context (§12.1). |
 
 ---
 
@@ -817,6 +828,10 @@ Tests live in `backend/src/code_review_agent/tests/`. `test_conversation_phase3.
 | 22 | Conversation turn | Persistence/evidence result; no synthesized answer | ✅ `test_turn_persists_messages_and_audit` |
 | 23 | Shared client | No second/per-request client | ✅ by construction (§14.3) |
 | 24 | Tool scope | Context Agent sees only `search_messages` | ✅ `test_plan_entry_exactly_search_messages`, `test_conversation_id_grants_search_messages_only` |
+| 25 | Conversation server down during tool build | Root gets no context tool; review proceeds | ✅ `test_tool_server_down_returns_none` |
+| 26 | Hostile identity keys in tool call | Rejected at schema validation (`extra="forbid"`) | ✅ `test_hostile_identity_kwargs_rejected_at_validation` |
+| 27 | LLM-visible schema scope | Exposes ONLY `query`/`limit`/`exclude_message_id`, no identity | ✅ `test_llm_visible_schema_exposes_no_identity` |
+| 28 | Context tool withheld (server down) | AVAILABLE prompt block omitted | ✅ `test_context_available_false_omits_block` |
 
 Live E2E (seeded fact → review cites it) is exercised separately against the running servers, not in unit tests.
 
@@ -910,6 +925,8 @@ controlled data access
 - [x] No autonomous answer-generation loop.
 - [x] `should_recall()` removed; Orchestrator is sole recall decision-maker.
 - [x] Context tool injected at root only when `conversation_id` present.
+- [x] Identity closure-bound (`extra="forbid"` args_schema) — hostile identity keys rejected at schema validation (§9.5).
+- [x] Server-down resilience: tool-build failure caught + logged; recall skipped; review proceeds (§10.2, §16).
 - [x] Evidence retains `message_id` provenance; `results[0]` never the answer; recency wins on contradiction.
 
 ### Review integration
@@ -917,6 +934,7 @@ controlled data access
 - [x] 400 when `conversation_id` supplied without `user_id`.
 - [x] Retrieval-before-delegation instruction in orchestrator prompt.
 - [x] Phase 2 path unchanged without context (root gets no tools).
+- [x] Degraded path: AVAILABLE prompt block omitted when the context tool was withheld (§11.2).
 - [x] Aggregator accepts `message #<id>` provenance.
 
 ### Conversation turn

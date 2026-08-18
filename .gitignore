@@ -9,6 +9,7 @@ scripts/test_crg_mcp.py
 ngrok.exe
 .ngrok.exe.old
 inspect_db.py
+session-backup.json
 # Added by code-review-graph
 .code-review-graph/
 .vscode/
