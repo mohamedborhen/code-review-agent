@@ -1,9 +1,14 @@
 """Use-case service that runs one conversation turn (PHASE_3.md §4, §6).
 
-Write path is Application-layer-only: user and assistant Messages plus any
-ToolCall rows are persisted here, never inside the read-only Context Agent.
-Identity (user_id/repo_id) is forwarded verbatim into search_messages, where
-the §5.1 authorization check runs.
+Write path is Application-layer-only: the user Message plus any ToolCall rows
+are persisted here, never inside the read-only Context Agent. Identity
+(user_id/repo_id) is forwarded verbatim into search_messages, where the §5.1
+authorization check runs.
+
+This turn flow is PERSISTENCE + EVIDENCE-CAPTURE ONLY — it does not generate an
+assistant answer. The Context Agent is a retrieval component: retrieved results
+are evidence with provenance, and answering is owned by the Review Orchestrator,
+never by this flow (PHASE_3.md §6; decisions D3/D4/D7).
 
 Threadpool boundary (AGENTS.md / PHASE_3.md §1): every synchronous SQLite
 persistence call is offloaded via ``asyncio.to_thread`` so the FastAPI event
@@ -37,14 +42,13 @@ async def run_conversation_turn(
     audit: ConversationAuditPort,
     max_context_results: int = 10,
 ) -> dict:
-    """Persist the user's message, recall context if needed, and return the turn.
+    """Persist the user's message and recall context evidence for the turn.
 
     Returns a serializable dict for the API layer:
         {
           "conversation_id": int,
           "user_message": str,
-          "assistant_reply": str,
-          "context": {...} | None,   # ContextRetrieval as plain dict
+          "context": {...} | None,   # ContextRetrieval as plain dict (evidence only)
           "tool_calls": [ {...}, ... ]   # ToolCall rows created this turn
         }
     """
@@ -62,11 +66,12 @@ async def run_conversation_turn(
         order_index=order_index,
         created_at=datetime.now(timezone.utc),
     )
-    await asyncio.to_thread(store.add_message, user_message_row)
+    user_message_row = await asyncio.to_thread(store.add_message, user_message_row)
 
-    # Recall context when the user explicitly references history, and always
-    # as cheap background evidence (PHASE_3.md §6: triggered when historical
-    # context is missing or referenced).
+    # Recall historical context as evidence. The just-persisted user message is
+    # excluded so it never matches itself (results would otherwise rank the
+    # current message first). Recall here is evidence-gathering for the turn —
+    # answering is owned by the Review Orchestrator (PHASE_3.md §6).
     context = await _recall_context(
         conversation_id=conversation_id,
         user_id=user_id,
@@ -75,20 +80,7 @@ async def run_conversation_turn(
         context_agent=context_agent,
         audit=audit,
         limit=max_context_results,
-    )
-
-    assistant_reply = _synthesize_reply(user_message, context)
-    reply_index = await asyncio.to_thread(store.next_order_index, conversation_id)
-    reply_message = await asyncio.to_thread(
-        store.add_message,
-        Message(
-            conversation_id=conversation_id,
-            role="assistant",
-            event_type="final",
-            content=assistant_reply,
-            order_index=reply_index,
-            created_at=datetime.now(timezone.utc),
-        ),
+        exclude_message_id=user_message_row.id,
     )
 
     tool_calls: list[ToolCall] = []
@@ -96,7 +88,7 @@ async def run_conversation_turn(
         tool_call = await asyncio.to_thread(
             store.add_tool_call,
             ToolCall(
-                message_id=reply_message.id or 0,
+                message_id=user_message_row.id or 0,
                 tool_name="search_messages",
                 tool_input=user_message[:200],
                 tool_output=_summarize_snippets(context),
@@ -109,7 +101,6 @@ async def run_conversation_turn(
     return {
         "conversation_id": conversation_id,
         "user_message": user_message,
-        "assistant_reply": assistant_reply,
         "context": _as_dict(context),
         "tool_calls": [tc.__dict__ for tc in tool_calls],
     }
@@ -124,6 +115,7 @@ async def _recall_context(
     context_agent: ContextAgentPort,
     audit: ConversationAuditPort,
     limit: int,
+    exclude_message_id: int | None = None,
 ) -> ContextRetrieval | None:
     started = time.monotonic()
     try:
@@ -133,6 +125,7 @@ async def _recall_context(
             repo_id=repo_id,
             query=query,
             limit=limit,
+            exclude_message_id=exclude_message_id,
         )
     except Exception as exc:
         # Recall is evidence-gathering, never a turn-fatal failure. Audit the
@@ -164,26 +157,6 @@ def _summarize_snippets(retrieval: ContextRetrieval) -> str:
         return ""
     joined = " || ".join(r.snippet for r in retrieval.results[:3])
     return joined[:4000]
-
-
-def _synthesize_reply(user_message: str, context: ContextRetrieval | None) -> str:
-    """Turn-reply synthesis.
-
-    PHASE_3.md §6 precedence: search_messages exact matches outrank MemorySummary,
-    and the most recent message wins on contradiction. This minimal synthesizer
-    surfaces the recalled evidence without an LLM; a summarizer pipeline may
-    replace it in later phases.
-    """
-    if context is None or context.error is not None or not context.results:
-        return (
-            "Understood. I don't have recalled context for this turn — "
-            "I'll answer from current knowledge."
-        )
-    best = context.results[0]
-    return (
-        f"Recalled from conversation history (message #{best.message_id}): "
-        f"{best.snippet}"
-    )
 
 
 def _as_dict(retrieval: ContextRetrieval | None) -> dict | None:

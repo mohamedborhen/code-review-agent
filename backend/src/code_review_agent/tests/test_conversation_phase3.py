@@ -126,6 +126,31 @@ def test_search_messages_authorization_cross_tenant() -> None:
     asyncio.run(main())
 
 
+def test_search_messages_exclude_message_id() -> None:
+    _seed(
+        [("acme/repo", "alice")],
+        [
+            (1, "user", "final", "the CLIP-4 fix", 0),
+            (1, "user", "final", "the CLIP-4 fix again", 1),
+        ],
+    )
+
+    async def main() -> None:
+        with mock.patch.object(server_module, "_DB_PATH", _DB_PATH):
+            without = json.loads(await server_module.search_messages(1, "alice", "acme/repo", "CLIP-4"))
+            assert without.get("error") is None and len(without["results"]) == 2
+            excluded = json.loads(
+                await server_module.search_messages(1, "alice", "acme/repo", "CLIP-4", exclude_message_id=2)
+            )
+            assert excluded.get("error") is None
+            assert {r["message_id"] for r in excluded["results"]} == {1}
+            # default None keeps prior behavior
+            defaulted = json.loads(await server_module.search_messages(1, "alice", "acme/repo", "CLIP-4", 10, None))
+            assert len(defaulted["results"]) == 2
+
+    asyncio.run(main())
+
+
 def test_turn_persists_messages_and_audit() -> None:
     from application.conversation_service.run_conversation_turn import run_conversation_turn
 
@@ -134,7 +159,9 @@ def test_turn_persists_messages_and_audit() -> None:
     audit = SQLModelConversationAudit(_test_engine)
 
     class _NullAgent:
-        async def search_context(self, conversation_id, user_id, repo_id, query, limit=10):
+        async def search_context(
+            self, conversation_id, user_id, repo_id, query, limit=10, exclude_message_id=None
+        ):
             from domain.entities.conversation_entity import ContextRetrieval
 
             return ContextRetrieval(conversation_id=conversation_id)
@@ -150,10 +177,10 @@ def test_turn_persists_messages_and_audit() -> None:
             audit=audit,
         )
         assert outcome["conversation_id"] == 1
-        assert outcome["assistant_reply"]
+        assert "assistant_reply" not in outcome  # answering owned by the orchestrator
         messages = repo.list_messages(1)
-        assert [m.role for m in messages] == ["user", "assistant"]
-        assert [m.order_index for m in messages] == [1, 2]  # monotonic
+        assert [m.role for m in messages] == ["user"]  # persistence only, no synthesized reply
+        assert [m.order_index for m in messages] == [1]  # monotonic
         with Session(_test_engine) as session:
             rows = session.exec(
                 AgentExecution.__table__.select().where(AgentExecution.agent_name == "context_agent")
@@ -162,6 +189,48 @@ def test_turn_persists_messages_and_audit() -> None:
             payload = json.loads(rows[-1].result)
             assert payload["conversation_id"] == 1
             assert "snippet" not in payload  # audit privacy: no content/snippets
+
+    asyncio.run(main())
+
+
+def test_turn_tool_call_attaches_to_user_message_id() -> None:
+    from domain.entities.conversation_entity import ContextRetrieval, ContextRetrievalResult
+    from application.conversation_service.run_conversation_turn import run_conversation_turn
+
+    repo = SQLModelConversationRepository(_test_engine)
+    _seed([("acme/repo", "alice")], [])
+    audit = SQLModelConversationAudit(_test_engine)
+
+    class _HittingAgent:
+        async def search_context(
+            self, conversation_id, user_id, repo_id, query, limit=10, exclude_message_id=None
+        ):
+            assert exclude_message_id is not None  # just-persisted message excluded
+            return ContextRetrieval(
+                conversation_id=conversation_id,
+                results=[
+                    ContextRetrievalResult(
+                        message_id=1, role="user", snippet="the CLIP-4 fix", score=1.0
+                    )
+                ],
+            )
+
+    async def main() -> None:
+        outcome = await run_conversation_turn(
+            1,
+            "alice",
+            "acme/repo",
+            "the CLIP-4 fix",
+            store=repo,
+            context_agent=_HittingAgent(),
+            audit=audit,
+        )
+        messages = repo.list_messages(1)
+        assert len(messages) == 1
+        user_id = messages[0].id
+        assert user_id is not None
+        assert outcome["tool_calls"], "expected a ToolCall row for the recall"
+        assert outcome["tool_calls"][0]["message_id"] == user_id  # FK valid
 
     asyncio.run(main())
 

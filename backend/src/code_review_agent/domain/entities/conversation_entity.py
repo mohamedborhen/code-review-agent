@@ -76,8 +76,9 @@ class ContextRetrieval:
 class ConversationTurn:
     """One turn of POST /conversations/{id}/message.
 
-    Request side: the user's message. Result side: the assistant's reply plus
-    any tool calls the turn executed and the context evidence used.
+    DEPRECATED semantics: request side is the user's message; the assistant
+    reply field is no longer produced by the turn flow (answering is owned by
+    the Review Orchestrator). Retained for the persistence/evidence contract.
     """
 
     conversation_id: int

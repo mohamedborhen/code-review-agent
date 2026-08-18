@@ -77,7 +77,12 @@ def _authorized(conversation_id: int, user_id: str, repo_id: str) -> bool:
 
 
 def _search(
-    conversation_id: int, user_id: str, repo_id: str, query: str, limit: int
+    conversation_id: int,
+    user_id: str,
+    repo_id: str,
+    query: str,
+    limit: int,
+    exclude_message_id: int | None = None,
 ) -> dict:
     """Synchronous core: authorization + FTS5 query. Runs in a threadpool."""
     if not _authorized(conversation_id, user_id, repo_id):
@@ -89,18 +94,20 @@ def _search(
 
     conn = _connect()
     try:
-        rows = conn.execute(
-            """
+        sql = """
             SELECT m.id, m.role, snippet(message_fts, 0, '[', ']', '...', 32) AS snippet,
                    m.created_at, -bm25(message_fts) AS score
             FROM message_fts f
             JOIN Message m ON f.rowid = m.id
             WHERE message_fts MATCH ? AND m.conversation_id = ?
-            ORDER BY score DESC
-            LIMIT ?
-            """,
-            (fts_query, conversation_id, clamped_limit),
-        ).fetchall()
+        """
+        params: list = [fts_query, conversation_id]
+        if exclude_message_id is not None:
+            sql += " AND m.id != ?"
+            params.append(exclude_message_id)
+        sql += " ORDER BY score DESC LIMIT ?"
+        params.append(clamped_limit)
+        rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
         return {"conversation_id": conversation_id, "results": [], "error": "invalid_query"}
     finally:
@@ -126,6 +133,7 @@ async def search_messages(
     repo_id: str,
     query: str,
     limit: int = 10,
+    exclude_message_id: int | None = None,
 ) -> str:
     """Search the conversation's message history (read-only).
 
@@ -138,6 +146,9 @@ async def search_messages(
     }
     `results` is sorted best-match-first. `score` is normalized so that
     HIGHER means a better match (negate SQLite's raw bm25(): `-bm25(message_fts) AS score`).
+    `exclude_message_id` optionally excludes one message id from the results
+    (used by the turn flow so a just-persisted user message never matches itself);
+    None means no exclusion.
 
     Error responses:
     {"conversation_id": int, "results": [], "error": "not_found"}
@@ -150,7 +161,7 @@ async def search_messages(
             {"conversation_id": conversation_id, "results": [], "error": "invalid_query"}
         )
     payload = await run_in_threadpool(
-        _search, conversation_id, user_id, repo_id, query, limit
+        _search, conversation_id, user_id, repo_id, query, limit, exclude_message_id
     )
     return json.dumps(payload)
 

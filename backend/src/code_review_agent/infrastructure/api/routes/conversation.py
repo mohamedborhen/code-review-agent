@@ -2,8 +2,15 @@
 
 - ``POST /conversations`` — open a conversation (user_id/repo_id in the body;
   there is no auth middleware, PHASE_3.md §9.5).
-- ``POST /conversations/{id}/message`` — run a turn via the Application-layer
-  use-case; the write path lives entirely in application/conversation_service.
+- ``POST /conversations/{id}/message`` — persist a turn and capture recall
+  evidence via the Application-layer use-case; the write path lives entirely in
+  application/conversation_service.
+
+DEPRECATED semantics: this endpoint no longer generates an assistant answer.
+The standalone Q&A/answer-generation path was removed — the Context Agent is a
+retrieval component and answering is owned by the Review Orchestrator. This
+endpoint remains operational as persistence + evidence capture for the memory
+substrate the orchestrator consumes.
 
 Async routes; synchronous SQLite persistence is offloaded via asyncio.to_thread
 so the event loop is never blocked (PHASE_3.md §1, AGENTS.md threadpool rule).

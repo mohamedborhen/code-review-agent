@@ -33,6 +33,8 @@ class ContextAgentPort(Protocol):
 
     Async because the MCP call goes over the wire; identity params are
     explicit and authorized server-side (PHASE_3.md §5.1).
+    ``exclude_message_id`` optionally excludes one message from the results so
+    a just-persisted user message never matches itself.
     """
 
     async def search_context(
@@ -42,6 +44,7 @@ class ContextAgentPort(Protocol):
         repo_id: str,
         query: str,
         limit: int = 10,
+        exclude_message_id: int | None = None,
     ) -> ContextRetrieval: ...
 
 
@@ -49,6 +52,8 @@ class ConversationAuditPort(Protocol):
     """AgentExecution audit rows for context-agent invocations (PHASE_3.md §7).
 
     Never logs message content or snippet text — only query/identity/counts.
+    ``review_session_id`` is set when the recall happens inside a review run
+    (None for standalone conversation turns).
     """
 
     def record_context_invocation(
@@ -58,4 +63,5 @@ class ConversationAuditPort(Protocol):
         results_count: int,
         latency_ms: int,
         status: str,
+        review_session_id: int | None = None,
     ) -> None: ...

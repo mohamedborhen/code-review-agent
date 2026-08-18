@@ -1,93 +1,290 @@
-```markdown
-# Phase 3 Implementation Spec — Conversation Schema, Conversation FastMCP, Context Agent
+# Phase 3 — Stateful Conversation Persistence, Conversation FastMCP, and Context Retrieval
 
-**Status:** Ready to build (Phase 3)  
-**Scope:** New stateful capability, additive to Phase 1 (Ingestion & Knowledge Graph Pipeline) and Phase 2 (Stateless Multi-Agent Review Core). Extends existing persistence, API layer, and agent orchestrator to support stateful conversation lifecycle and context recall.
+**Status:** Implemented & verified — post-implementation architecture and operational specification.
+**Phase:** 3
+**Predecessors:** Phase 1 — Ingestion & Knowledge Graph Pipeline; Phase 2 — Stateless Multi-Agent Review Core.
+**Primary goal:** Persist conversation history and make that history safely retrievable by the Phase 2 Review Orchestrator when the orchestrator determines that historical context is useful.
+**Implementation note:** This document describes the final Phase 3 architecture as built. Test execution status must be taken from the project test/E2E reports; this document does not claim that tests passed unless recorded there.
+
+> **Important:** Phase 3 adds a conversation-history substrate and a retrieval boundary. It does **not** implement the complete memory architecture. Shared Memory, Private Memory, and LangMem-based summarization are intentionally deferred to Phase 4. This document's final section (§20) is the explicit handoff contract for the Phase 4 architect.
 
 ---
 
 ## 0. How to use this document
 
-This is a build contract, not a suggestion. If something you need is not written down here, **do not infer it, do not default to a "reasonable" choice, and do not copy a pattern from an unrelated framework.** Stop and surface the gap as a question in `OPENCODE.md` instead of writing code around it. Section 9 documents the explicit resolutions to all architectural questions surfaced during the pre-flight audit.
+This is the authoritative reference for Phase 3. Anyone who has never seen this phase should be able to reconstruct its architecture, security model, data flows, and runtime wiring from this file alone.
 
-Before writing any code that touches FastMCP or SQLite FTS5 syntax, verify the exact API via the Context7 MCP tool, per the project's existing library-verification rule. Do not write MCP server/tool decorator code from memory.
+Section 1 lists the non-negotiable compliance constraints. Section 2 is the compliance matrix mapping each requirement to its implementation. Sections 3–19 document the architecture, schema, contracts, security, runtime, and tests. Section 20 is the Phase 3→4 handoff.
 
 ---
 
 ## 1. Non-negotiable compliance constraints
 
-These come directly from the existing Phase 1/2 architecture and pre-flight audit resolutions:
+These come directly from the existing Phase 1/2 architecture and the Phase 3 pre-flight audit resolutions. They remain in force as built:
 
-- **5-layer clean architecture is mandatory.** Domain layer (Layer 4) code for this feature (`domain/entities/`) must contain zero imports of `fastapi`, `deepagents`, `langchain_mcp_adapters`, `pydantic`, `git`/`subprocess`, `mcp`, or `sqlmodel` — same rule already enforced on `AgentFinding`/`AgentOutput`.
-- **File Placement Discipline.** ORM models must be appended to the existing `infrastructure/db/models.py` file (not a `models/` directory, which collides with the existing module). Application services belong under `application/conversation_service/`.
-- **Sync/Async execution boundaries.** FastMCP tool invocations and SQLite transactions must not block the FastAPI event loop. Synchronous SQLite persistence calls must be wrapped in threadpool executors (e.g., using `run_in_threadpool`) or use explicit async sessions to match strict concurrency rules.
-- **SQLite concurrency settings must match Phase 1**: `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on every connection that touches the new tables.
-- **MCP registration must follow the existing `MultiServerMCPClient` lifespan pattern.** The new Conversation FastMCP server is a 5th streamable HTTP server added to the static client instantiated at FastAPI startup (`app.state`). Do not create a second or per-request MCP client.
-- **Static Client Identity Transport.** Because `MultiServerMCPClient` headers are static per-server configs set once at startup, dynamic identity attributes (`user_id`, `repo_id`) are passed as explicit typed arguments to `search_messages` and populated by Layer 3 Application orchestration from the API request body. There is no auth middleware in the codebase (deferred in Phase 1) — `POST /conversations` and `POST /conversations/{id}/message` must accept `user_id` and `repo_id` in the request body, and the Layer 3 orchestrator forwards them verbatim into `search_messages`, where the §5.1 authorization check runs.
-- **Explicit tool lists only.** The Conversation MCP must register a named, minimal tool list (`["search_messages"]`) — never a wildcard.
-- **The Context Agent is read-only, full stop.** Mirror the Fix Suggestion agent's precedent: the Context Agent may only ever be given search/read tools. No tool that can INSERT, UPDATE, or DELETE conversation data is ever exposed to it.
-- **No `execute_sql`-style tool, ever.** Every tool this MCP exposes must be a rigid, typed Python function.
-- **Audit discipline matches `ReviewSession`/`AgentExecution`.** Context Agent invocations must be logged with structured output (`json.dumps(dataclasses.asdict())`) and must log on failure too, not just success.
-- **Startup Wiring Exception.** An explicit, documented exception is granted in `infrastructure/db/engine.py` to execute raw DDL for FTS5 tables (`message_fts`) and triggers during `init_db()`.
+- **5-layer clean architecture is mandatory.** Domain layer (Layer 4) code (`domain/entities/conversation_entity.py`) contains zero imports of `fastapi`, `deepagents`, `langchain_mcp_adapters`, `pydantic`, `git`/`subprocess`, `mcp`, or `sqlmodel` — same rule already enforced on `AgentFinding`/`AgentOutput`.
+- **File Placement Discipline.** All ORM models are appended to `infrastructure/db/models.py` (never a `models/` directory, which collides with the module import). Application services live under `application/conversation_service/`.
+- **Sync/Async execution boundaries.** FastMCP tool invocations and synchronous SQLite transactions must never block the FastAPI event loop. SQLite persistence calls are wrapped in `asyncio.to_thread`; the FastMCP server's synchronous search core runs via `fastapi.concurrency.run_in_threadpool`.
+- **SQLite concurrency settings match Phase 1**: `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` on every connection that touches the new tables. Phase 3 additionally enables `PRAGMA foreign_keys=ON` on every connection (required for `ON DELETE CASCADE` to fire).
+- **MCP registration follows the existing `MultiServerMCPClient` lifespan pattern.** The Conversation FastMCP server is the 5th streamable-HTTP server in the static client constructed once at FastAPI startup (`app.state.mcp_client`). No second or per-request MCP client is ever created.
+- **Static Client Identity Transport.** Because `MultiServerMCPClient` headers are static per-server configs set once at startup, dynamic identity attributes (`user_id`, `repo_id`, `conversation_id`) are passed as explicit typed arguments to `search_messages`, populated by Layer 3 Application orchestration from the API request body. There is no auth middleware in the codebase — `POST /conversations` and `POST /conversations/{id}/message` accept `user_id` and `repo_id` in the request body, and the Layer 3 orchestrator forwards them verbatim into `search_messages`, where the §8.2 authorization check runs server-side.
+- **Identity is closure-bound for the LLM, never LLM-supplied.** The audited context tool granted to the orchestrator root agent binds `conversation_id`/`user_id`/`repo_id` at construction time (server-side, before the LLM ever sees the tool). Its LLM-visible `args_schema` exposes ONLY `query`/`limit`/`exclude_message_id` with `extra="forbid"`, so a hostile/injected call that tries to smuggle identity keys is REJECTED at schema validation (pydantic `ValidationError`) — never silently overridden downstream. The underlying `search_messages` tool still takes identity as explicit typed args (the turn-flow path is unaffected).
+- **Explicit tool lists only.** The Conversation MCP registers a named, minimal tool list (`["search_messages"]`) — never a wildcard.
+- **The Context Agent is read-only, full stop.** It is granted ONLY the `search_messages` tool. No tool that can INSERT, UPDATE, or DELETE conversation data is ever exposed to it.
+- **No `execute_sql`-style tool, ever.** Every tool this MCP exposes is a rigid, typed Python function. SQL is written and controlled by backend code.
+- **Audit discipline matches `ReviewSession`/`AgentExecution`.** Context Agent invocations are logged to `AgentExecution` via `json.dumps(dataclasses.asdict())`, on success AND failure. **Never log message content or snippet text** into audit tables.
+- **Startup Wiring Exception.** An explicit, documented exception is granted in `infrastructure/db/engine.py` to execute raw DDL during `init_db()` for the `message_fts` FTS5 virtual table, its 3 sync triggers (`message_ai`, `message_ad`, `message_au`), and the `_rebuild_agentexecution()` 4-step table-rebuild migration.
+- **FTS5 Query Protection.** Input queries in `search_messages` MUST be phrase-quoted (`'"' + query.replace('"', '""') + '"'`) before running FTS `MATCH` statements to prevent SQLite `OperationalError` when searching hyphenated terms (e.g. `CLIP-4`).
+- **`tool_name_prefix` stays at its default (`False`)** on `MultiServerMCPClient`. No prefix-stripping or fuzzy matching in `scoped()`.
+- **`handle_tool_errors` stays at its default (`True`)**: an MCP tool failure returns a `ToolMessage(status="error")` for the agent to handle instead of crashing the review.
 
 ---
 
-## 2. Database schema (exact DDL & migrations)
+## 2. Compliance matrix (requirement → implementation)
 
-### 2.1 Core Tables (`infrastructure/db/models.py`)
+| Requirement | Where implemented | Status |
+|---|---|---|
+| 5-layer clean architecture; zero framework imports in domain | `domain/entities/conversation_entity.py` (dataclasses only) | ✅ |
+| ORM models appended to `infrastructure/db/models.py` | `Conversation`, `Message`, `ToolCall`, `MemorySummary` (`__tablename__` PascalCase) | ✅ |
+| WAL + `busy_timeout=5000` on all DB connections | `engine.py` connect listener; `conversation_server._connect()` | ✅ |
+| `PRAGMA foreign_keys=ON` | `engine.py` connect listener; `conversation_server._connect()` | ✅ |
+| Conversation FastMCP = 5th server in shared `MultiServerMCPClient` | `infrastructure/mcp_clients/mcp_client_factory.py:59-62` | ✅ |
+| No second/per-request MCP client | Single `build_mcp_client()` in `main.py` lifespan → `app.state.mcp_client` | ✅ |
+| Static identity transport (typed args, not headers) | `search_messages(conversation_id, user_id, repo_id, ...)` | ✅ |
+| Explicit tool list for Context Agent | `tool_lists.py`: `context_agent → {"conversation": {"search_messages"}}` | ✅ |
+| Context Agent read-only | Only `search_messages` (SELECT-only) exists anywhere in its path | ✅ |
+| No `execute_sql` tool | Conversation server exposes exactly one `@mcp.tool()` | ✅ |
+| Audit on success and failure, no content/snippets | `SQLModelConversationAudit.record_context_invocation` | ✅ |
+| FTS5 raw DDL in `init_db()` | `engine.py:_create_fts_index()` | ✅ |
+| FTS5 phrase-quoting | `conversation_server.py:91-92` | ✅ |
+| `tool_name_prefix` default False | `mcp_client_factory.py` (never set) | ✅ |
 
-Append these SQLModel definitions to `infrastructure/db/models.py` using PascalCase table naming:
+---
 
-```sql
-CREATE TABLE Conversation (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_id    TEXT NOT NULL,
-    user_id    TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
-    created_at DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-CREATE INDEX idx_conversation_repo_user ON Conversation(repo_id, user_id);
+## 3. Final architecture
 
-CREATE TABLE Message (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id INTEGER NOT NULL REFERENCES Conversation(id) ON DELETE CASCADE,
-    role            TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
-    event_type      TEXT NOT NULL CHECK (event_type IN ('thinking','tool_use','final')),
-    content         TEXT NOT NULL,
-    order_index     INTEGER NOT NULL,
-    created_at      DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')),
-    UNIQUE(conversation_id, order_index)
-);
-CREATE INDEX idx_message_conversation_id ON Message(conversation_id);
+Phase 2 is intentionally stateless: a review receives the repository/review inputs, the Review Orchestrator routes work to specialist agents, and the Aggregator produces the review result. Phase 3 adds a persistent conversation layer **without changing** core review behavior when historical context is unavailable or unnecessary.
 
-CREATE TABLE ToolCall (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id      INTEGER NOT NULL REFERENCES Message(id) ON DELETE CASCADE,
-    tool_name       TEXT NOT NULL,
-    tool_input      TEXT,
-    tool_output     TEXT,
-    tool_latency_ms INTEGER,
-    tool_status     TEXT CHECK (tool_status IN ('success','error'))
-);
-CREATE INDEX idx_tool_call_message_id ON ToolCall(message_id);
+The central architectural change: conversation history is no longer an independent question-answering system. It is a **searchable evidence source for the Review Orchestrator**.
 
-CREATE TABLE MemorySummary (
-    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id              INTEGER NOT NULL REFERENCES Conversation(id) ON DELETE CASCADE,
-    summary_text                 TEXT NOT NULL,
-    summarized_up_to_message_id  INTEGER NOT NULL REFERENCES Message(id),
-    created_at                   DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-CREATE INDEX idx_memory_summary_conversation_id ON MemorySummary(conversation_id);
+### 3.1 Architecture diagram
 
+```text
+                         HTTP / API Layer
+                               │
+                 ┌─────────────┴─────────────┐
+                 │                           │
+          Conversation endpoints        POST /review
+                 │                           │
+                 ▼                           ▼
+       Layer 3 Conversation Service   Review Orchestrator
+                 │                     (DeepAgents)
+                 │                           │
+          persist messages                   │ conversation_id?
+                 │                           │
+                 ▼                           ▼
+          SQLite conversation DB      scoped search_messages tool
+                                             │
+                                             ▼
+                                  Conversation FastMCP Server
+                                             │
+                                   authorization + FTS5
+                                             │
+                                             ▼
+                                      SQLite + FTS5
+                                             │
+                                             ▼
+                                  historical evidence
+                                             │
+                                             ▼
+                                  Review Orchestrator
+                                             │
+                         ┌───────────────────┴───────────────────┐
+                         │                                       │
+                  reason over evidence                    specialist delegation
+                                                                 │
+                                                                 ▼
+                                                        Phase 2 review flow
 ```
 
-Field types, nullability, and constraints above are final. `UNIQUE(conversation_id, order_index)` is required to enforce deterministic conversation ordering.
+### 3.2 Responsibility split
 
-### 2.2 FTS5 Index & Triggers (`infrastructure/db/engine.py`)
+| Responsibility | Owner |
+|---|---|
+| Persist conversation | Layer 3 application + SQLite/SQLModel |
+| Search messages | Conversation FastMCP + FTS5 |
+| Authorize conversation access | Conversation MCP server (server-side) |
+| Decide whether recall is useful | Review Orchestrator LLM |
+| Interpret historical evidence | Review Orchestrator |
+| Preserve provenance | MCP result (`message_id`) + orchestrator reasoning |
+| Resolve conflicting historical facts | Orchestrator using recency |
+| Review code | Existing Phase 2 specialists |
+| Aggregate findings | Existing Phase 2 Aggregator |
+| Summarize memory | **Phase 4 / LangMem** |
+| Shared memory | **Phase 4** |
+| Private memory | **Phase 4** |
 
-Executed via raw SQL inside `init_db()` in `infrastructure/db/engine.py`:
+### 3.3 Core principles
+
+1. **`conversation_id` means availability, not mandatory recall.** A `conversation_id` on a review makes historical context *available*; it never forces a retrieval.
+
+2. **The Review Orchestrator is the sole recall decision-maker.** There is no heuristic gate. The previous `should_recall()` marker/substring implementation is removed (`delegate_to_context_agent.py` deleted — must not be reintroduced under another name). Recall is a judgment made by the orchestrator's LLM from the conversation context and the review request.
+
+3. **Context retrieval happens before specialist delegation when used.** This is a behavioral instruction in the orchestrator prompt, not a hard-coded application gate — the orchestrator must remain the authority over whether and when retrieval occurs.
+
+4. **Retrieved data is evidence, not an answer.** `search_messages` returns evidence; `results[0]` is never treated as an answer. The orchestrator reasons over the complete returned evidence set, retains `message_id` provenance, and applies recency when historical statements contradict.
+
+5. **The Context Agent is read-only and retrieval-only.** It is not an independent autonomous DeepAgents agent and has no independent LLM responsible for answering questions.
+
+6. **Phase 2 behavior is unchanged without recall.** No `conversation_id` → the root orchestrator gets NO tools (Phase 2 behavior). `conversation_id` present but no recall → no context call, no context audit row.
+
+---
+
+## 4. End-to-end data flows
+
+### 4.1 Review with historical context available
+
+```text
+POST /review
+  │  repo_id, request_type, branch|graph_commit_hash, diff_content?,
+  │  question?, conversation_id?, user_id?
+  ▼
+FastAPI review route (infrastructure/api/routes/review.py)
+  │  ├─ validate request_type (400 on unknown)
+  │  ├─ validate exactly one of branch | graph_commit_hash (400)
+  │  ├─ require user_id when conversation_id is supplied (400)
+  │  ├─ resolve branch → commit via GitHub MCP (404 if branch missing)
+  │  ├─ prepare repository review context (404 unknown repo, 425 graph not ready)
+  │  ├─ touch per-branch LRU recency (best-effort, never fails review)
+  │  └─ create ReviewSession audit row (status=running)
+  ▼
+AgentInput (now carries conversation_id + user_id)
+  ▼
+Review Orchestrator / DeepAgents (run_review)
+  │  ├─ root tools: conversation_id present → [audited search_messages tool]
+  │  │              conversation_id absent → None (Phase 2 path)
+  │  ├─ classify/interpret request
+  │  └─ LLM decides whether historical context is useful
+  │        ├─ NO ─────────────────────────────► normal Phase 2 delegation
+  │        └─ YES
+  │             ▼
+  │       search_messages(conversation_id, user_id, repo_id, query)
+  │             ▼
+  │       Conversation FastMCP: authz → FTS5 phrase-quote → MATCH → BM25
+  │             ▼
+  │       historical evidence (message_id, role, snippet, created_at, score)
+  │             ▼
+  │       audit wrapper (metadata only; no snippets/content)
+  │             ▼
+  │       Orchestrator reasons over full evidence, retains provenance,
+  │       applies recency, then delegates specialists
+  │             ▼
+  │       Phase 2 specialists → Aggregator → review response
+```
+
+### 4.2 Conversation write / retrieval lifecycle
+
+```text
+POST /conversations
+  │  {repo_id, user_id}
+  ▼
+SQLModelConversationRepository.create_conversation
+  ▼
+Conversation row (id, repo_id, user_id, status='active', timestamps)
+  ▼
+conversation_id returned
+
+POST /conversations/{id}/message
+  │  {user_id, repo_id, content}
+  ▼
+run_conversation_turn (application/conversation_service/)
+  │  ├─ verify conversation exists (404 if not)
+  │  ├─ next_order_index() = max order_index + 1  (monotonic)
+  │  ├─ persist user Message (role=user, event_type=final)
+  │  ├─ recall historical context via search_messages,
+  │  │    exclude_message_id = the just-persisted message id
+  │  ├─ if results: persist ToolCall row (tool_name=search_messages)
+  │  │    with tool_input (query, truncated), tool_output (snippets), latency, status
+  │  └─ audit context invocation (query/counts/latency/status only)
+  ▼
+Return {conversation_id, user_message, context (evidence), tool_calls}
+  (NO assistant answer — answering is owned by the Review Orchestrator)
+```
+
+The old standalone `_synthesize_reply()` behavior is removed/deprecated. The conversation endpoint is a persistence/evidence surface; the Review Orchestrator owns review reasoning and answering.
+
+---
+
+## 5. Conversation database schema
+
+The conversation layer uses the same SQLite database file as Phase 1/2 (`settings.metadata_db_path`). All ORM models live in `infrastructure/db/models.py`. Table names are **explicit PascalCase** (`__tablename__`) so the FTS5 external-content reference `content='Message'` and the exact PascalCase DDL requirement both hold. SQLModel's default (lowercased class name) would silently produce `message`/`conversation` and break `content='Message'` resolution.
+
+### 5.1 Conversation
+
+Stores the conversation identity and lifecycle.
+
+| Field | Type | Constraints | Purpose |
+|---|---|---|---|
+| `id` | INTEGER | PK, autoincrement | Conversation identifier |
+| `repo_id` | TEXT | NOT NULL | Repository scope |
+| `user_id` | TEXT | NOT NULL | User scope |
+| `status` | TEXT | NOT NULL DEFAULT 'active', CHECK `active`/`archived` | Lifecycle state |
+| `created_at` | DATETIME | NOT NULL, server default UTC | Creation timestamp |
+| `updated_at` | DATETIME | NOT NULL, server default UTC | Last-update timestamp |
+
+Index: `idx_conversation_repo_user(repo_id, user_id)`.
+
+### 5.2 Message
+
+Stores searchable conversation events. `id` doubles as the provenance key the orchestrator retains.
+
+| Field | Type | Constraints | Purpose |
+|---|---|---|---|
+| `id` | INTEGER | PK, autoincrement | Message identifier / provenance key |
+| `conversation_id` | INTEGER | NOT NULL, FK → Conversation(id) ON DELETE CASCADE, indexed | Parent conversation |
+| `role` | TEXT | NOT NULL, CHECK `user`/`assistant`/`system` | Message origin |
+| `event_type` | TEXT | NOT NULL, CHECK `thinking`/`tool_use`/`final` | Event category |
+| `content` | TEXT | NOT NULL | Searchable content |
+| `order_index` | INTEGER | NOT NULL | Deterministic conversation ordering |
+| `created_at` | DATETIME | NOT NULL, server default UTC | Temporal ordering |
+
+Required constraint: `UNIQUE(conversation_id, order_index)` — prevents ambiguous conversation ordering. Monotonicity is guaranteed by `next_order_index()` (read `max(order_index)` + 1) in the same transaction context as the insert.
+
+### 5.3 ToolCall
+
+Stores tool-execution metadata associated with a message. **Not indexed by FTS5 in Phase 3 v1.**
+
+| Field | Type | Purpose |
+|---|---|---|
+| `id` | INTEGER | Tool execution identifier |
+| `message_id` | INTEGER | Parent Message (FK → Message(id) ON DELETE CASCADE, indexed) |
+| `tool_name` | TEXT | Executed tool |
+| `tool_input` | TEXT | Serialized input |
+| `tool_output` | TEXT | Serialized output |
+| `tool_latency_ms` | INTEGER | Execution duration |
+| `tool_status` | TEXT | CHECK `success`/`error` |
+
+### 5.4 MemorySummary
+
+Schema exists for the planned Phase 4 memory phase. **In Phase 3 it is an implemented-but-unwired artifact**: the `summarize_conversation()` deterministic v1 use-case and the `ConversationStorePort.add_memory_summary()` adapter both exist, but **nothing in the active Phase 3 flow calls them**. It is neither populated by the turn flow nor queried by the Context Agent. It is deliberately kept in place as the Phase 4 LangMem replacement/summarization hook (see §20).
+
+| Field | Type | Purpose |
+|---|---|---|
+| `id` | INTEGER | Summary identifier |
+| `conversation_id` | INTEGER | Parent Conversation (FK → Conversation(id) ON DELETE CASCADE, indexed) |
+| `summary_text` | TEXT | Summary content |
+| `summarized_up_to_message_id` | INTEGER | High-water mark (FK → Message(id)) |
+| `created_at` | DATETIME | Creation timestamp |
+
+---
+
+## 6. SQLite FTS5 search architecture
+
+### 6.1 Why FTS5
+
+Conversation recall requires lexical retrieval over stored message content without introducing another database service or vector-search infrastructure. Phase 3 deliberately avoids: PostgreSQL `tsvector`, `pgvector`, ChromaDB, embedding generation, generic RAG, and arbitrary SQL MCP tools.
+
+### 6.2 Virtual table (raw DDL in `engine.py:_create_fts_index()`)
 
 ```sql
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
@@ -95,207 +292,645 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
     content='Message',
     content_rowid='id',
     tokenize = "porter unicode61 tokenchars '_-.'"
-);
-
-CREATE TRIGGER IF NOT EXISTS message_ai AFTER INSERT ON Message BEGIN
-    INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS message_ad AFTER DELETE ON Message BEGIN
-    INSERT INTO message_fts(message_fts, rowid, content) VALUES('delete', old.id, old.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS message_au AFTER UPDATE ON Message BEGIN
-    INSERT INTO message_fts(message_fts, rowid, content) VALUES('delete', old.id, old.content);
-    INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
-END;
-
+)
 ```
 
-`porter unicode61 tokenchars '_-.'` is required so identifiers like `CLIP-4` or `snake_case_filename` are not shredded.
+### 6.3 Tokenization
 
-### 2.3 Table Rebuild Script for `AgentExecution`
+`porter unicode61` = basic stemming + Unicode-aware tokenization. `tokenchars '_-.'` preserves identifiers like `CLIP-4`, `snake_case_filename`, and `0.85` instead of shredding them. FTS5 remains lexical — no semantic similarity, no typo tolerance, no embeddings.
 
-Implement `_rebuild_agentexecution()` in `infrastructure/db/engine.py` (following the established `_rebuild_repoworkspace` 4-step pattern) to alter `review_session_id` from `NOT NULL` to `NULLABLE` and add an optional `conversation_id` FK:
+### 6.4 Synchronization triggers
 
-1. Create `agentexecution_temp` with `review_session_id INTEGER NULL REFERENCES ReviewSession(id)` and `conversation_id INTEGER NULL REFERENCES Conversation(id)`. The temp table must include **all** existing `AgentExecution` columns (`agent_name`, `duration_ms`, `confidence`, `model`, `result`, `created_at`, plus the two FK columns) so the copy in step 2 preserves every column — follow the full-schema `_rebuild_repoworkspace` 4-step pattern, not just the FK columns shown here.
-2. Copy existing records from `AgentExecution` into `agentexecution_temp`.
-3. Drop table `AgentExecution`.
-4. Rename `agentexecution_temp` to `AgentExecution`.
+Created in `init_db()` via the raw-DDL startup exception:
 
----
+```text
+INSERT Message ──► message_ai ──► insert into message_fts(rowid, content)
+UPDATE Message ──► message_au ──► delete old row + insert new row
+DELETE Message ──► message_ad ──► delete from message_fts
+```
 
-## 3. Layer placement & Repository Structure
+### 6.5 Search data flow
 
-Place all Phase 3 files strictly in the exact repository paths established in Phase 1/2:
-
-* **Layer 4 (Domain):** `domain/entities/conversation_entity.py` — framework-free dataclasses mirroring `AgentFinding`/`AgentOutput`.
-* **Layer 5 (Infrastructure):**
-* `infrastructure/db/models.py` — SQLModel ORM models for `Conversation`, `Message`, `ToolCall`, `MemorySummary`.
-* `infrastructure/db/engine.py` — `init_db()` extensions for raw FTS5 DDL and `_rebuild_agentexecution()`.
-* `infrastructure/mcp_clients/servers/conversation_server.py` — FastMCP server implementation.
-* `infrastructure/mcp_clients/mcp_client_factory.py` — Registration of Conversation FastMCP as 5th server.
-* `infrastructure/agents_runtime/subagents/context_agent_runtime.py` — Context Agent runtime setup.
-* `infrastructure/api/routes/conversation.py` — Endpoints for stateful turns (`POST /conversations` and `POST /conversations/{id}/message`), accepting `user_id` and `repo_id` in the request body (no auth middleware exists; identity is caller-supplied and authorized inside `search_messages`).
-
-
-* **Layer 3 (Application):** `application/conversation_service/` — `run_conversation_turn.py`, `delegate_to_context_agent.py`, and summarization pipelines.
-
----
-
-## 4. Write Path & Persistence Lifecycle
-
-Because the Context Agent and its toolset are strictly read-only, all persistence operations for the new schema occur in the Orchestrator/Application layer outside the Context Agent's execution loop:
-
-* **Message and ToolCall Writes:** New `Message` and `ToolCall` rows are inserted by the Application layer (`application/conversation_service/`) during an active conversation turn (`POST /conversations/{id}/message`). These writes must be wrapped in explicit transaction boundaries to guarantee `order_index` monotonicity and rollback safety on failure.
-* **MemorySummary Writes:** `MemorySummary` generation and database insertion is triggered asynchronously or strictly at the end of a conversation turn by a dedicated summarizer service, never by the read-only Context Agent.
+```text
+Message.content
+      ▼
+SQLite trigger
+      ▼
+message_fts virtual table
+      ▼
+FTS5 MATCH (phrase-quoted query)
+      ▼
+BM25 ranking (−bm25() so higher = better)
+      ▼
+search_messages result
+```
 
 ---
 
-## 5. Conversation FastMCP — tool contract
+## 7. `search_messages` MCP contract
 
-Exactly one tool for Phase 3:
+The Conversation FastMCP server (`infrastructure/mcp_clients/servers/conversation_server.py`) exposes **exactly one** Phase 3 tool:
 
 ```python
-MAX_SEARCH_RESULTS = 25
-MAX_QUERY_LENGTH = 200
-
 @mcp.tool()
-def search_messages(
+async def search_messages(
     conversation_id: int,
     user_id: str,
     repo_id: str,
     query: str,
-    limit: int = 10
+    limit: int = 10,
+    exclude_message_id: int | None = None,
 ) -> str:
-    """
-    Returns a JSON string:
-    {
-      "conversation_id": int,
-      "results": [
-        {"message_id": int, "role": str, "snippet": str, "created_at": str, "score": float}
-      ]
-    }
-    `results` is sorted best-match-first. `score` is normalized so that
-    HIGHER means a better match (negate SQLite's raw bm25(): `-bm25(message_fts) AS score`).
-
-    Error responses:
-    {"conversation_id": int, "results": [], "error": "not_found"}
-      — conversation does not exist or user_id/repo_id authorization check fails.
-    {"conversation_id": int, "results": [], "error": "invalid_query"}
-      — query exceeds MAX_QUERY_LENGTH or causes an FTS5 syntax operational error.
-    """
-
 ```
 
-### 5.1 Internal Tool Execution & FTS5 Phrase Quoting
+### 7.1 Inputs
 
-1. **Mandatory Authorization Check:**
-Execute `SELECT 1 FROM Conversation WHERE id = :conversation_id AND user_id = :user_id AND repo_id = :repo_id`. On missing row or identity mismatch, return `{"conversation_id": conversation_id, "results": [], "error": "not_found"}` to prevent IDOR access without leaking existence.
-2. **FTS5 Query Protection (Sanitization):**
-To prevent unhandled `OperationalError` when searching terms containing hyphens or operators (e.g. `CLIP-4`), query strings MUST be sanitized and wrapped in phrase quotes before passing to SQLite:
-```python
-clean_query = query.strip().replace('"', '""')
-fts_query = f'"{clean_query}"'
+| Parameter | Meaning |
+|---|---|
+| `conversation_id` | Conversation to search |
+| `user_id` | Caller identity, used by the server-side authorization check |
+| `repo_id` | Repository scope, used by the authorization check |
+| `query` | Lexical search query |
+| `limit` | Max result count, server-clamped to `1..25` |
+| `exclude_message_id` | Optional message ID excluded from results; prevents a just-persisted user message from matching itself during a conversation turn |
 
+### 7.2 Successful response
+
+```json
+{
+  "conversation_id": 123,
+  "results": [
+    {"message_id": 42, "role": "user", "snippet": "...", "created_at": "2026-08-17T10:00:00Z", "score": 4.21}
+  ]
+}
 ```
 
+`results` sorted best-match-first. `score` is higher-is-better because SQLite's raw BM25 score is negated: `-bm25(message_fts) AS score`. `snippet` uses `snippet(message_fts, 0, '[', ']', '...', 32)`.
 
-3. **Execution Query:**
+### 7.3 Error semantics
+
+| Case | Response |
+|---|---|
+| Unauthorized / nonexistent conversation | `{"conversation_id": N, "results": [], "error": "not_found"}` |
+| Query > 200 chars, or FTS5 `OperationalError` | `{"conversation_id": N, "results": [], "error": "invalid_query"}` |
+
+`not_found` and `invalid_query` must remain distinguishable — a malformed query must never be interpreted as "no historical information exists."
+
+### 7.4 Limits
+
+```text
+MAX_SEARCH_RESULTS = 25
+MAX_QUERY_LENGTH   = 200
+```
+
+`limit` is clamped to `max(1, min(limit, 25))`. Queries longer than 200 chars (after `.strip()`) return `invalid_query`. `sqlite3.OperationalError` from malformed FTS syntax is caught and converted to `invalid_query`.
+
+### 7.5 Internal execution
+
+1. **Authorization** (runs in a threadpool):
+   ```sql
+   SELECT 1 FROM Conversation WHERE id = ? AND user_id = ? AND repo_id = ?
+   ```
+   Missing row / identity mismatch → `not_found` (no existence leak).
+2. **FTS5 query protection**:
+   ```python
+   clean_query = query.strip().replace('"', '""')
+   fts_query = f'"{clean_query}"'
+   ```
+3. **Execution query**:
+   ```sql
+   SELECT m.id, m.role, snippet(message_fts, 0, '[', ']', '...', 32) AS snippet,
+          m.created_at, -bm25(message_fts) AS score
+   FROM message_fts f
+   JOIN Message m ON f.rowid = m.id
+   WHERE message_fts MATCH ? AND m.conversation_id = ?
+   [AND m.id != ?]           -- when exclude_message_id is provided
+   ORDER BY score DESC LIMIT ?
+   ```
+
+### 7.6 Threadpool offloading
+
+`search_messages` is declared `async`; its synchronous core (`_search`, including the auth check and the SQLite read) runs via `fastapi.concurrency.run_in_threadpool` so the FastMCP event loop is never blocked. Each `_connect()` opens a fresh connection with `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`.
+
+---
+
+## 8. Security model
+
+### 8.1 No arbitrary SQL
+
+The Conversation MCP never exposes an `execute_sql` tool. The LLM can only invoke `search_messages(...)`. SQL is written and controlled by backend code.
+
+### 8.2 Authorization
+
+`conversation_id` is not an authorization boundary by itself. The Conversation MCP performs a server-side identity/scope check equivalent to:
+
 ```sql
-SELECT m.id, m.role, snippet(message_fts, 0, '[', ']', '...', 32) AS snippet,
-       m.created_at, -bm25(message_fts) AS score
-FROM message_fts f
-JOIN Message m ON f.rowid = m.id
-WHERE message_fts MATCH :fts_query AND m.conversation_id = :conversation_id
-ORDER BY score DESC
-LIMIT :clamped_limit;
-
+SELECT 1 FROM Conversation WHERE id = :conversation_id AND user_id = :user_id AND repo_id = :repo_id;
 ```
 
+If no matching row exists, the server returns `not_found` — identical for "conversation does not exist" and "conversation belongs to another user/repository." This prevents an existence/IDOR-style information leak.
 
-4. **Limits & Error Handling:**
-* `limit` is clamped server-side to `1 <= limit <= MAX_SEARCH_RESULTS`.
-* Query strings exceeding `MAX_QUERY_LENGTH` or throwing `sqlite3.OperationalError` must return `{"conversation_id": conversation_id, "results": [], "error": "invalid_query"}`.
+### 8.3 Read-only Context Agent
 
+The Context Agent cannot access database writes. Persistence is exclusively in the Layer 3 application flow (`run_conversation_turn`), never inside the Context Agent's path.
 
+### 8.4 Network boundary
 
----
+The Conversation FastMCP server is an internal service bound to `127.0.0.1` on port 9001 by default (`settings.conversation_mcp_url = "http://127.0.0.1:9001/mcp"`, bind host `127.0.0.1` unless `CONVERSATION_SERVER_HOST` is set). docker-compose runs it as its own `conversation-server` service bound to `0.0.0.0` so the `code-review-agent` container can reach it over the compose network (mirrors mcp-atlassian's `HOST` env). The security model never depends on an LLM-controlled identity value being trustworthy by itself — the server-side authorization check remains mandatory.
 
-## 6. Context Agent
+### 8.5 No raw snippets in audit logs
 
-* Additive subagent built in `infrastructure/agents_runtime/subagents/context_agent_runtime.py`, given **only** the `search_messages` tool.
-* Triggered by the Layer 3 Application layer when historical conversation context is missing or referenced by the user.
-* Retrieved results are evidence, not conclusions. The Orchestrator must retain `message_id` provenance.
-* **Default Precedence Rules:**
-* `search_messages` results outrank `MemorySummary` content.
-* For contradicting messages across turns, the most recent message by `created_at`/`id` supersedes.
-
-
+Audit records contain metadata only (`query`, `conversation_id`, `results_count`, `latency_ms`, `status`) — never retrieved message content or snippets.
 
 ---
 
-## 7. Audit logging
+## 9. Audit logging
 
-Extend the existing `ReviewSession`/`AgentExecution` audit pattern to cover Context Agent invocations:
+Context retrieval uses the existing `ReviewSession` / `AgentExecution` audit pattern — no second logging system.
 
-* `review_session_id`: `None` (optional/nullable).
-* `conversation_id`: Target conversation ID.
-* `agent_name`: `"context_agent"`.
-* `result`: Structured JSON string via `json.dumps(dataclasses.asdict())` recording `query`, `conversation_id`, `results_count`, `latency_ms`, and `status`.
-* **Strict Privacy Rule:** Explicitly **do not** log returned message content or snippet text in the audit tables.
+### 9.1 Row shape (`AgentExecution`)
 
----
+| Column | Value |
+|---|---|
+| `review_session_id` | `None` for standalone turns; the active review session id when recall happens inside `POST /review` (nullable) |
+| `conversation_id` | Target conversation id (optional FK, nullable) |
+| `agent_name` | `"context_agent"` |
+| `duration_ms` | Tool wall time |
+| `result` | JSON via `json.dumps(dataclasses.asdict())` |
 
-## 8. Explicit "do not" list
+### 9.2 Audit payload (the `result` JSON)
 
-* Do not add a tool that accepts raw SQL, a table name, or a column name.
-* Do not expose any write-capable tool (INSERT/UPDATE/DELETE) to the Context Agent.
-* Do not add vector/embedding search, ChromaDB, or any external RAG component.
-* Do not skip the FTS5 sync triggers.
-* Do not let the "not found" vs "not yours" authorization responses differ.
-* Do not return raw `bm25()` values as `score` without negating them.
-* Do not pass unquoted user queries directly into FTS `MATCH` statements (must phrase-quote to handle hyphens like `CLIP-4`).
-* Do not let a malformed FTS5 query raise an unhandled exception.
-* Do not create a `models/` directory alongside `models.py`.
-* Do not instantiate a second `MultiServerMCPClient` or per-request MCP clients.
-
----
-
-## 9. Architectural Decisions & Resolutions
-
-| # | Topic | Decision / Resolution |
-| --- | --- | --- |
-| 1 | Database Location | Uses the same SQLite `.db` file as Phase 1/2 (`RepoWorkspace`/`ReviewSession`). |
-| 2 | FTS Scope | Includes `Message.content` only. `ToolCall.tool_input`/`tool_output` are excluded from FTS v1. |
-| 3 | Memory Summary Precedence | `search_messages` exact matches outrank `MemorySummary`. `MemorySummary` serves as general background. |
-| 4 | Network Binding & Port | FastMCP server binds to `127.0.0.1` on an unused internal port configured via `settings.conversation_mcp_url` (default `http://127.0.0.1:9001/mcp`). |
-| 5 | Identity Transport | Explicit `user_id` and `repo_id` typed parameters passed to `search_messages`, populated by Layer 3 orchestration. |
-| 6 | Database Migration | `AgentExecution.review_session_id` made nullable via `_rebuild_agentexecution()` 4-step table rebuild helper in `engine.py`. |
-| 7 | Contradiction Policy | Recency wins: most recent message by `created_at`/`id` supersedes historical ones. |
-| 8 | Privacy in Auditing | Query strings logged; returned text snippets and message contents redacted from audit logs. |
-
----
-
-## 10. Definition of done
-
-* [ ] `AgentExecution` table rebuilt via `_rebuild_agentexecution()` with nullable `review_session_id` and optional `conversation_id`.
-* [ ] All four tables created with exact PascalCase DDL in `infrastructure/db/models.py`, FK constraints active.
-* [ ] `message_fts` + all three sync triggers created in `infrastructure/db/engine.py` via `init_db()` startup exception.
-* [ ] WAL mode + `busy_timeout=5000` confirmed active across all DB connections.
-* [ ] Threadpool/Async execution boundaries enforced for SQLite/FastMCP operations.
-* [ ] Write path explicitly defined and isolated to Layer 3 `application/conversation_service/` logic.
-* [ ] `search_messages` implemented as the **only** tool on the Conversation FastMCP server.
-* [ ] FTS5 query phrase-quoting implemented and verified against hyphenated search strings (`CLIP-4`).
-* [ ] Authorization check implemented and verified via cross-tenant test (`user_id`/`repo_id` validation).
-* [ ] Context Agent runtime created with strict read-only access to `search_messages`.
-* [ ] Context Agent invocations logged via `AgentExecution` without logging content/snippets.
-* [ ] Domain-layer entities (`domain/entities/conversation_entity.py`) contain zero disallowed framework imports.
-* [ ] `UNIQUE(conversation_id, order_index)` constraint present and tested against duplicate order inserts.
-* [ ] FTS5 `tokenchars '_-.'` configured and tested with identifier strings.
-* [ ] `score` field confirmed higher-is-better (`-bm25(...)`).
-* [ ] `limit` and `query` length bounds enforced server-side.
-
+```json
+{
+  "query": "...",
+  "conversation_id": 123,
+  "results_count": 4,
+  "latency_ms": 18,
+  "status": "ok"
+}
 ```
 
+`status` literal values: `"ok"` on success (note: **`"ok"`, not `"success"`**), `"not_found"` / `"invalid_query"` on those error responses, `"invalid_response"` on unparsable payloads, `"error:<ExceptionType>"` when the tool call itself raises.
+
+### 9.3 Strict privacy rule
+
+Audit records must never contain: message content, snippets, full retrieved evidence, or tool output containing conversation text. The turn flow's `ToolCall` row is the only place snippets may persist, and it is a conversation-substrate row, not an audit row.
+
+### 9.4 Coverage
+
+- Successful context calls are audited.
+- Failed context calls are audited (both the turn flow's `_recall_context` failure path and the tool-error path).
+- `review_session_id` is populated for review-triggered retrieval; `None` for standalone turns.
+- No-recall reviews produce **no** context audit row (no invocation occurred).
+
+---
+
+## 10. Context Agent runtime
+
+File: `infrastructure/agents_runtime/subagents/context_agent_runtime.py`.
+
+The Context Agent is a **retrieval-only capability** implemented around the Conversation MCP `search_messages` tool. It is **not** a `deepagents.SubAgent` dict and not an autonomous reasoning loop — context recall is a single deterministic tool call, so the "runtime" is the scoped-tool accessor + audited wrapper the orchestrator uses.
+
+```text
+DeepAgents Review Orchestrator
+             │
+             │ tool available only when conversation_id exists
+             ▼
+    audited context retrieval tool
+             │
+             ▼
+    Conversation FastMCP
+             │
+             ▼
+      SQLite + FTS5
 ```
+
+### 10.1 `get_search_messages_tool(mcp_client)`
+
+Fetches `server_name="conversation"` tools from the shared client and scopes to exactly `{"search_messages"}` via `scoped()` (explicit named list — never a wildcard). Returns the single tool, or `None` if the tool is absent (server down / not registered) so callers can skip recall without failing the review.
+
+### 10.2 `get_audited_context_tool(mcp_client, *, conversation_id, user_id, repo_id, audit, review_session_id, store)`
+
+Builds the tool granted to the orchestrator root agent:
+
+1. `scope_agent_tools(mcp_client, "context_agent", store)` — the event-wrapped (timeline-captured) scoped `search_messages` tool.
+2. Wraps it with an audit wrapper that, per invocation: times the call, parses the JSON payload for `results_count`/`status`, and records one `AgentExecution` row through the injected `ConversationAuditPort` (query/counts/latency/status only — never content).
+3. **Identity is closure-bound at construction time.** `conversation_id`/`user_id`/`repo_id` are injected server-side into every invocation; the LLM-visible `args_schema` is the narrow `ContextSearchQuery` model exposing ONLY `query`/`limit`/`exclude_message_id` with `extra="forbid"`. A hostile call that tries to supply identity keys is rejected at schema validation before the underlying tool runs — the LLM cannot choose, guess, or exfiltrate a scope.
+4. Returns `None` when the tool is unavailable so the caller can skip recall without failing the review.
+
+### 10.3 `search_conversation_context(mcp_client, *, conversation_id, user_id, repo_id, query, limit, exclude_message_id)`
+
+Invokes the scoped tool with explicit typed identity params. Returns the raw JSON string from the tool (or `None` when unavailable). Caller owns parsing + audit logging.
+
+### 10.4 Read-only invariant
+
+The Context Agent never writes: no write tool exists anywhere in its path, and it is strictly a historical-conversation retrieval component (no shared/private memory, no summarization).
+
+---
+
+## 11. Review Orchestrator integration
+
+File: `infrastructure/agents_runtime/orchestrator_runtime.py`.
+
+### 11.1 Root tool injection (`_build_root_tools`)
+
+```text
+conversation_id is None  ──► return None        (Phase 2 path: root gets NO tools)
+conversation_id present  ──► build audited context tool
+                                ├─ tool unavailable → return None (recall skipped)
+                                └─ tool available  → return [audited_context_tool]
+```
+
+The distinction between `None` (no tools — Phase 2 byte-for-byte) and `[]` (tools withheld) is preserved. `deepagents` merges the `tools` argument additively with its built-in suite, so the root's `task` tool is preserved; the safety harness profile (`ensure_review_harness_profile`) still strips filesystem/execute built-ins.
+
+### 11.2 Conversation context block (`_conversation_context_block`)
+
+When `conversation_id` is present, the orchestrator's user message gains a "Historical conversation context is AVAILABLE" block. Identity (`conversation_id`/`user_id`/`repo_id`) is NOT declared — it is closure-bound into the tool at construction time (§10.2), so the block tells the LLM the tool is pre-scoped and instructs:
+
+- call `search_messages` ONLY if historical context is needed — never on every request;
+- do not pass `conversation_id`/`user_id`/`repo_id` — they are supplied server-side;
+- if called, do so **BEFORE** delegating to subagents;
+- treat results as evidence (reason over all of them, never answer from a single snippet);
+- retain the `message_id` of every hit relied on;
+- when recalled messages contradict, prefer the **most recent** one.
+
+The block is absent when no conversation is supplied (Phase 2 prompt byte-for-byte).
+
+### 11.3 Orchestrator prompt (`prompts/orchestrator.md`)
+
+Defines: historical context is optional; the orchestrator decides whether to retrieve; retrieval occurs before delegation when needed; retrieved content is evidence with provenance, not conclusions; all evidence should be considered; `message_id` provenance must be retained; recency wins on conflict; no single result may automatically become the answer.
+
+### 11.4 Aggregator prompt (`prompts/aggregator.md`)
+
+Instruction 7: when the orchestrator consulted conversation history, it may cite evidence as `message #<id>` in a finding's evidence list. Those citations are first-class evidence, treated like `file:line` references; the message id is retained verbatim.
+
+### 11.5 Audit wiring in reviews
+
+The audited context tool is built with `SQLModelConversationAudit()` and the active `review_session_id`, so recall inside a review records `review_session_id` + `conversation_id` on the `AgentExecution` row.
+
+---
+
+## 12. Conversation turn flow
+
+File: `application/conversation_service/run_conversation_turn.py`.
+
+**PERSISTENCE + EVIDENCE-CAPTURE ONLY.** It does not generate an assistant answer. The Context Agent is a retrieval component; answering is owned by the Review Orchestrator (decisions D3/D4/D7).
+
+### 12.1 Flow
+
+1. `store.get_conversation(conversation_id)` — raise `ConversationNotFoundError` (→ HTTP 404) if missing.
+2. `store.next_order_index(conversation_id)` — `max(order_index) + 1`, monotonic.
+3. Persist the user `Message` (`role="user"`, `event_type="final"`, `order_index`, `created_at`).
+4. Recall historical context (`_recall_context`): `search_context(..., exclude_message_id=user_message_row.id)` so the just-persisted message never matches itself. Recall is evidence-gathering — a failure is audited (`status="error:<Type>"`) and the turn continues without context.
+5. If results exist, persist a `ToolCall` row (`tool_name="search_messages"`, `tool_input=query[:200]`, `tool_output=first-3 snippets joined ≤ 4000 chars`, `tool_latency_ms`, `tool_status="success"|"error"`).
+6. Audit the context invocation (query/counts/latency/status).
+7. Return `{conversation_id, user_message, context, tool_calls}`.
+
+### 12.2 Threadpool boundary
+
+Every synchronous SQLite call (`get_conversation`, `next_order_index`, `add_message`, `add_tool_call`) and the audit write run through `asyncio.to_thread`. The Context Agent call is async by nature (wire call).
+
+### 12.3 MemorySummary — implemented but unwired (Phase 4 hook)
+
+`application/conversation_service/summarize_conversation.py` provides a deterministic, dependency-free v1 summarizer (`summarize_conversation(conversation_id, *, store, recent_messages)` → persists a `MemorySummary` via `store.add_memory_summary()`). **Nothing calls it in Phase 3** — no route, no turn flow, no test. It is kept deliberately as the Phase 4 LangMem replacement point (an LLM summarizer can swap in behind the same `ConversationStorePort.add_memory_summary` port without touching the persistence layer). `MemorySummary` is NOT queried or ranked by the Context Agent, and must not be silently added to Phase 3 retrieval.
+
+---
+
+## 13. Updated folder architecture
+
+```text
+project-root/
+│
+├── domain/                              # Layer 4 — framework-free domain
+│   └── entities/
+│       ├── agent_finding.py             # AgentInput gains conversation_id/user_id
+│       └── conversation_entity.py       # Conversation, Message, ToolCall, MemorySummary,
+│                                        #   ContextRetrieval, ContextRetrievalResult, ConversationTurn
+│
+├── application/                         # Layer 3 — use cases/orchestration
+│   └── conversation_service/
+│       ├── ports.py                     # ConversationStorePort, ContextAgentPort, ConversationAuditPort
+│       ├── run_conversation_turn.py     # persistence + evidence-oriented turn flow
+│       └── summarize_conversation.py    # deterministic v1 MemorySummary (UNWIRED Phase 4 hook)
+│
+├── infrastructure/                     # Layer 5 — technical implementation
+│   ├── api/
+│   │   ├── models.py                    # ReviewRequest gains conversation_id/user_id
+│   │   └── routes/
+│   │       ├── conversation.py          # POST /conversations, POST /conversations/{id}/message
+│   │       └── review.py                # 400 user_id rule, conversation_id/user_id → AgentInput
+│   │
+│   ├── db/
+│   │   ├── models.py                    # Conversation, Message, ToolCall, MemorySummary (PascalCase)
+│   │   ├── engine.py                    # init_db(): FTS5, triggers, migrations, PRAGMA foreign_keys=ON
+│   │   ├── conversation_repository.py   # SQLModelConversationRepository = ConversationStorePort adapter (persistence)
+│   │   └── conversation_ports_adapters.py  # McpContextAgent (ContextAgentPort/retrieval) +
+│   │                                      #   SQLModelConversationAudit (ConversationAuditPort/audit)
+│   │
+│   ├── mcp_clients/
+│   │   ├── mcp_client_factory.py        # shared MultiServerMCPClient, conversation = 5th server; scoped()
+│   │   └── servers/
+│   │       └── conversation_server.py   # FastMCP server: typed search_messages + server-side authorization
+│   │
+│   └── agents_runtime/
+│       ├── orchestrator_runtime.py      # optional root context-tool injection
+│       ├── tool_lists.py                # AGENT_TOOL_PLAN["context_agent"] = {"conversation": {"search_messages"}}
+│       ├── prompts/
+│       │   ├── orchestrator.md          # evidence/recall/provenance/recency instructions
+│       │   └── aggregator.md            # message #<id> provenance acceptance
+│       └── subagents/
+│           └── context_agent_runtime.py # scoped + audited read-only context tool wrapper
+│
+└── tests/
+    ├── test_conversation_phase3.py      # schema, FTS5, migration, authorization, turn flow
+    └── test_context_agent_review_integration.py  # orchestrator↔context integration contract
+```
+
+### 13.1 Removed legacy module
+
+```text
+application/conversation_service/delegate_to_context_agent.py
+```
+
+Deleted. It contained the unused `should_recall()` heuristic and a separate delegation function that no longer matches the final architecture. `should_recall()` must **not** be reintroduced under another name — the Review Orchestrator is the sole recall decision-maker.
+
+---
+
+## 14. MCP registration and tool scoping
+
+### 14.1 Shared client
+
+One `MultiServerMCPClient` is constructed once at FastAPI startup (`app.state.mcp_client`) via `build_mcp_client()` in `main.py`'s lifespan. Phase 3 adds Conversation FastMCP as the 5th configured server:
+
+```text
+1. CRG         (streamable_http, settings.crg_server_url)
+2. GitHub      (streamable_http, read-only headers: X-MCP-Readonly + X-MCP-Toolsets)
+3. Atlassian   (streamable_http, settings.atlassian_mcp_url)
+4. Context7    (streamable_http, https://mcp.context7.com/mcp)
+5. Conversation (streamable_http, settings.conversation_mcp_url)
+```
+
+### 14.2 Tool scoping (`tool_lists.py`)
+
+```python
+CONVERSATION = {"context_agent": {"search_messages"}}
+
+AGENT_TOOL_PLAN["context_agent"] = {"conversation": {"search_messages"}}
+```
+
+The Context Agent receives exactly `Conversation.search_messages` — never a wildcard, never a write tool. `scope_agent_tools()` (in `tool_scoping.py`) wraps each scoped tool with event-bus timeline capture (`_wrap_with_events`) and a 4000-char result truncation cap fed back to the model.
+
+### 14.3 No per-request client
+
+No second or per-request `MultiServerMCPClient` is created. The client is static at startup; identity flows as explicit typed tool arguments (see §1 Static Client Identity Transport).
+
+---
+
+## 15. Configuration and runtime wiring
+
+### 15.1 Settings (`infrastructure/config.py`)
+
+```python
+conversation_mcp_url: str = "http://127.0.0.1:9001/mcp"
+```
+
+docker-compose overrides it to `http://conversation-server:9001/mcp` in the `code-review-agent` service. Never hardcode `127.0.0.1` in the client factory.
+
+### 15.2 Conversation server launch
+
+```text
+python -m infrastructure.mcp_clients.servers.conversation_server
+```
+
+`_BIND_HOST` defaults to `127.0.0.1` for local dev; `CONVERSATION_SERVER_HOST=0.0.0.0` in docker-compose so the `code-review-agent` container can reach it. Port comes from `settings.conversation_mcp_url` (`_port_from_url`, default 9001). Transport is `streamable-http`, path `/mcp`.
+
+### 15.3 docker-compose `conversation-server` service
+
+```yaml
+conversation-server:
+  command: python -m infrastructure.mcp_clients.servers.conversation_server
+  environment:
+    - CONVERSATION_MCP_URL=http://127.0.0.1:9001/mcp
+    - CONVERSATION_SERVER_HOST=0.0.0.0
+  volumes: [workspace_data:/app/data]
+  depends_on: [code-review-agent]
+  restart: unless-stopped
+```
+
+### 15.4 Services required for Phase 3 work
+
+```text
+- code-review-graph serve --http --port 5555            (Phase 1)
+- uvx mcp-atlassian --transport streamable-http --port 9000  (Phase 2)
+- Conversation FastMCP server                           (Phase 3, port 9001)
+```
+
+---
+
+## 16. Failure behavior and operational semantics
+
+| Scenario | Behavior |
+|---|---|
+| Missing conversation context | Review proceeds through the existing Phase 2 path. Not an error. |
+| Conversation available but recall unnecessary | Context tool available; orchestrator may not call it. No context audit row. |
+| Unauthorized conversation | `not_found` for both nonexistent and unauthorized — no existence leak. |
+| Invalid search query | `invalid_query` (overlong or FTS5 `OperationalError`). Never crashes the server; never interpreted as an empty historical result. |
+| Context retrieval failure | Audited with failure status; the turn/review continues per existing error-handling policy. Never converts an error into a successful empty result; never invents evidence. |
+| Conflicting historical messages | FTS5 score is not truth — the most recent message by `created_at`/`id` takes precedence (recency wins). |
+| Conversation server down / tool absent | `get_search_messages_tool` / `get_audited_context_tool` return `None`; recall is skipped, review proceeds. |
+
+---
+
+## 17. Concurrency and database execution
+
+- `PRAGMA journal_mode=WAL;` and `PRAGMA busy_timeout=5000;` on every connection touching the conversation tables (engine connect listener + `conversation_server._connect()`).
+- `PRAGMA foreign_keys=ON;` on every connection (engine connect listener + `conversation_server._connect()`).
+- Synchronous SQLite in the FastAPI app runs via `asyncio.to_thread`.
+- The FastMCP server's synchronous search core runs via `fastapi.concurrency.run_in_threadpool`.
+- FastMCP calls use the application's existing MCP lifecycle — no per-request `MultiServerMCPClient`.
+
+---
+
+## 18. Request and response contracts
+
+### 18.1 `ReviewRequest` (new fields)
+
+```json
+{
+  "repo_id": "owner/repository",
+  "request_type": "review",
+  "branch": "feature/example",
+  "graph_commit_hash": null,
+  "diff_content": "...",
+  "question": "...",
+  "conversation_id": 123,
+  "user_id": "user-42"
+}
+```
+
+- `conversation_id` is optional.
+- `conversation_id` supplied without `user_id` → HTTP 400 (`_validate_conversation_identity`).
+- Values flow into `AgentInput.conversation_id` / `AgentInput.user_id`.
+
+### 18.2 `CreateConversationRequest` / `MessageTurnRequest`
+
+```text
+POST /conversations              {repo_id, user_id}
+POST /conversations/{id}/message {user_id, repo_id, content}
+```
+
+`MessageTurnRequest` includes `user_id`/`repo_id` so `search_messages`' authorization check can run (no auth middleware — identity is caller-supplied and authorized server-side).
+
+### 18.3 `search_messages` request / response
+
+See §7. Request and response JSON shapes are exact there.
+
+---
+
+## 19. Verification and test matrix
+
+Tests live in `backend/src/code_review_agent/tests/`. `test_conversation_phase3.py` uses a dedicated temp SQLite engine (patched module-global engine during `init_db()`); `test_context_agent_review_integration.py` uses fake MCP clients / a recording audit port, no live LLM.
+
+| # | Scenario | Expected | Coverage |
+|---|---|---|---|
+| 1 | Create conversation | Row with correct user/repo scope | unit (repository) |
+| 2 | Persist message | Inserted with unique order index | ✅ `test_turn_persists_messages_and_audit` |
+| 3 | Duplicate order index | DB rejects (UNIQUE) | ✅ `test_unique_order_index_enforced` |
+| 4 | FTS insert | New Message searchable | ✅ `test_fts_phrase_quoting_hyphen` |
+| 5 | FTS update | Updated content reflected | unit-untested (trigger code review) |
+| 6 | FTS delete | Deleted Message removed | ✅ `test_foreign_keys_active_cascade` (cascade path) |
+| 7 | `CLIP-4` search | Identifier searchable | ✅ `test_fts_phrase_quoting_hyphen` |
+| 8 | `snake_case` search | Identifier searchable | unit-untested (tokenizer config verified in DDL) |
+| 9 | Overlong query | `invalid_query` | ✅ `test_invalid_query_audited_gracefully` |
+| 10 | Malformed FTS syntax | `invalid_query`, no exception | ✅ same (OperationalError path) |
+| 11 | Wrong user | `not_found` | ✅ `test_search_messages_authorization_cross_tenant` |
+| 12 | Wrong repository | `not_found` | ✅ same (cross-tenant) |
+| 13 | Nonexistent conversation | `not_found` | ✅ `test_search_messages_authorization_cross_tenant` |
+| 14 | Current-message exclusion | `exclude_message_id` honored | ✅ `test_search_messages_exclude_message_id`, `test_turn_tool_call_attaches_to_user_message_id` |
+| 15 | Review without conversation_id | Phase 2 path: root has no tools | ✅ `test_no_conversation_id_grants_no_root_tools` |
+| 16 | Review with conversation_id, no recall | No search call; no audit row | prompt-instructed (orchestrator decides) |
+| 17 | Review with recall | Search before specialist delegation | prompt-instructed + `test_conversation_block_present_with_identity` |
+| 18 | Evidence provenance | `message_id` retained in findings | ✅ prompt + aggregator `message #<id>` rule |
+| 19 | Contradictory history | Most recent wins | prompt-instructed (recency rule) |
+| 20 | Context call failure | Audited, no content logged | ✅ `test_invalid_query_audited_gracefully` |
+| 21 | Context call success | Audited, no content logged | ✅ `test_audit_row_carries_session_and_conversation`; `assert "snippet" not in payload` |
+| 22 | Conversation turn | Persistence/evidence result; no synthesized answer | ✅ `test_turn_persists_messages_and_audit` |
+| 23 | Shared client | No second/per-request client | ✅ by construction (§14.3) |
+| 24 | Tool scope | Context Agent sees only `search_messages` | ✅ `test_plan_entry_exactly_search_messages`, `test_conversation_id_grants_search_messages_only` |
+
+Live E2E (seeded fact → review cites it) is exercised separately against the running servers, not in unit tests.
+
+---
+
+## 20. Phase 3 → 4 handoff (for the Phase 4 architect)
+
+Phase 3 intentionally creates the persistence and retrieval foundation the Phase 4 memory system must build on. The intended evolution:
+
+```text
+                         Phase 3
+                           │
+             ┌─────────────┴─────────────┐
+             │                           │
+      Conversation DB              Context retrieval
+             │                           │
+             └─────────────┬─────────────┘
+                           │
+                           ▼
+                    Phase 4 memory phase
+                           │
+             ┌─────────────┼─────────────┐
+             │             │             │
+      Shared Memory   Private Memory   LangMem
+             │             │             │
+             └─────────────┼─────────────┘
+                           ▼
+                    summarization
+```
+
+### 20.1 What Phase 4 must build
+
+1. **LangMem shared memory for agents** — cross-conversation / persistent knowledge store.
+2. **Private memory per agent** — each specialist agent gets its own private memory scope.
+3. **Context-window-based summarization** — summarize messages when the **context window is almost full**, NOT after a fixed message count.
+
+### 20.2 Existing substrate to consume (do not re-invent)
+
+- `MemorySummary` table, `ConversationStorePort.add_memory_summary`, and `summarize_conversation.py` (deterministic v1) — the natural LangMem summarization replacement point behind the same port.
+- `Message`/`ToolCall` persisted conversation history.
+- `search_messages` retrieval boundary.
+
+### 20.3 Boundaries that must be preserved (non-negotiable)
+
+```text
+LLM
+ │
+ ▼
+controlled typed tool
+ │
+ ▼
+server-side authorization
+ │
+ ▼
+controlled data access
+```
+
+- The Context Agent stays read-only; no write tool is ever exposed to an LLM without explicit human confirmation outside its tool list.
+- Memory writes happen in the application layer, never inside the Context Agent's path.
+- Audit privacy rule extends to any new memory tables: never log content/snippets into `AgentExecution`.
+- No second/per-request MCP client; no `execute_sql` tool; FTS5 phrase-quoting and server-side authorization remain.
+- Shared/private memory and LangMem are Phase 4 scope; do not implement them speculatively in a later-phase file.
+
+---
+
+## 21. Definition of done (verified)
+
+### Persistence
+- [x] `Conversation`, `Message`, `ToolCall`, `MemorySummary` tables implemented (PascalCase `__tablename__`).
+- [x] Foreign keys active (`PRAGMA foreign_keys=ON`).
+- [x] `UNIQUE(conversation_id, order_index)` enforced.
+- [x] `MemorySummary` schema retained; summarizer implemented-but-unwired (Phase 4 hook), not in the active Phase 3 flow.
+
+### FTS5
+- [x] `message_fts` created with `porter unicode61 tokenchars '_-.'`.
+- [x] `message_ai` / `message_ad` / `message_au` sync triggers created in `init_db()`.
+- [x] BM25 negated (higher-is-better).
+- [x] Hyphenated identifiers tested (`CLIP-4`).
+
+### Conversation MCP
+- [x] Conversation FastMCP = 5th server in shared `MultiServerMCPClient`.
+- [x] `search_messages` is the only exposed Phase 3 tool.
+- [x] No `execute_sql` tool.
+- [x] Authorization checks `conversation_id + user_id + repo_id` server-side.
+- [x] `not_found` identical for unauthorized/nonexistent.
+- [x] Query (`200`) and result (`25`) limits enforced; `invalid_query` on malformed/overlong.
+- [x] `exclude_message_id` supported.
+
+### Context Agent capability
+- [x] Read-only; single tool.
+- [x] No autonomous answer-generation loop.
+- [x] `should_recall()` removed; Orchestrator is sole recall decision-maker.
+- [x] Context tool injected at root only when `conversation_id` present.
+- [x] Evidence retains `message_id` provenance; `results[0]` never the answer; recency wins on contradiction.
+
+### Review integration
+- [x] `ReviewRequest` and `AgentInput` carry `conversation_id`/`user_id`.
+- [x] 400 when `conversation_id` supplied without `user_id`.
+- [x] Retrieval-before-delegation instruction in orchestrator prompt.
+- [x] Phase 2 path unchanged without context (root gets no tools).
+- [x] Aggregator accepts `message #<id>` provenance.
+
+### Conversation turn
+- [x] User messages persist; `exclude_message_id` prevents self-match.
+- [x] ToolCall/evidence metadata persisted.
+- [x] Standalone `_synthesize_reply()` removed.
+- [x] Conversation endpoints remain as the persistent-history substrate.
+
+### Audit and privacy
+- [x] Context invocations audited on success and failure.
+- [x] `review_session_id` nullable; populated for review-triggered calls.
+- [x] Audit records contain no snippets/content.
+- [x] No second/per-request MCP client.
+
+### Future memory boundary
+- [x] Shared Memory, Private Memory, LangMem, and summarization not activated in Phase 3.
+- [x] Phase 4 can consume the persisted substrate without changing the Phase 3 retrieval contract.

@@ -91,6 +91,7 @@ async def review(
         raise HTTPException(status_code=400, detail=f"Unknown request_type: {body.request_type}")
 
     _validate_branch_or_hash(body)
+    _validate_conversation_identity(body)
 
     if body.branch is not None:
         owner, _, repo = body.repo_id.partition("/")
@@ -142,9 +143,13 @@ async def review(
         diff_content=body.diff_content,
         repo_root=repo_root,
         question=body.question,
+        conversation_id=body.conversation_id,
+        user_id=body.user_id,
     )
 
-    orchestrator = OrchestratorRuntime(request.app.state.mcp_client)
+    orchestrator = OrchestratorRuntime(
+        request.app.state.mcp_client, review_session_id=session_id
+    )
 
     start = time.monotonic()
     try:
@@ -179,6 +184,17 @@ def _validate_branch_or_hash(body: ReviewRequest) -> None:
         raise HTTPException(
             status_code=400,
             detail="Provide exactly one of 'branch' or 'graph_commit_hash'",
+        )
+
+
+def _validate_conversation_identity(body: ReviewRequest) -> None:
+    """conversation_id makes historical context AVAILABLE (never mandatory
+    recall); it requires caller-supplied user_id for the search_messages
+    authorization check (PHASE_3.md §9.5)."""
+    if body.conversation_id is not None and body.user_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id is required when conversation_id is provided",
         )
 
 

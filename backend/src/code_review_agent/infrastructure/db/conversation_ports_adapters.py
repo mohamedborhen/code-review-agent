@@ -35,6 +35,7 @@ class McpContextAgent:
         repo_id: str,
         query: str,
         limit: int = 10,
+        exclude_message_id: int | None = None,
     ) -> ContextRetrieval:
         started = time.monotonic()
         raw = await search_conversation_context(
@@ -44,6 +45,7 @@ class McpContextAgent:
             repo_id=repo_id,
             query=query,
             limit=limit,
+            exclude_message_id=exclude_message_id,
         )
         latency_ms = int((time.monotonic() - started) * 1000)
         if raw is None:
@@ -94,6 +96,7 @@ class SQLModelConversationAudit:
         results_count: int,
         latency_ms: int,
         status: str,
+        review_session_id: int | None = None,
     ) -> None:
         # Audit payload records query + counts only — never message content or
         # snippet text (PHASE_3.md §7 Strict Privacy Rule).
@@ -109,7 +112,7 @@ class SQLModelConversationAudit:
         with Session(self._engine) as session:
             session.add(
                 AgentExecution(
-                    review_session_id=None,
+                    review_session_id=review_session_id,
                     conversation_id=conversation_id,
                     agent_name="context_agent",
                     duration_ms=latency_ms,

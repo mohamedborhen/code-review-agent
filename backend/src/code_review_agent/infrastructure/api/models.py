@@ -15,3 +15,5 @@ class ReviewRequest(BaseModel):
     request_type: str  # must match a key in the Routing Policy
     diff_content: str | None = None  # optional — explain_question may not need one
     question: str | None = None  # optional — free-form question; steers any_question AND the single-specialist question types
+    conversation_id: int | None = None  # optional — historical context AVAILABLE, never mandatory recall
+    user_id: str | None = None  # required when conversation_id is set; authorized inside search_messages

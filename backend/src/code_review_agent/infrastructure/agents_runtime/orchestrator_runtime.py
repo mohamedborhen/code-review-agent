@@ -39,12 +39,14 @@ from infrastructure.agents_runtime.middleware import (
 from infrastructure.agents_runtime.report_parse import extract_json_text as _extract_json
 from infrastructure.agents_runtime.report_schema import FindingItem, SubagentReport
 from infrastructure.agents_runtime.subagents.compliance_runtime import build_compliance_spec
+from infrastructure.agents_runtime.subagents.context_agent_runtime import get_audited_context_tool
 from infrastructure.agents_runtime.subagents.fix_suggestion_runtime import build_fix_suggestion_spec
 from infrastructure.agents_runtime.subagents.performance_runtime import build_performance_spec
 from infrastructure.agents_runtime.subagents.regression_runtime import build_regression_spec
 from infrastructure.agents_runtime.subagents.security_runtime import build_security_spec
 from infrastructure.agents_runtime.tool_scoping import load_prompt
 from infrastructure.config import settings
+from infrastructure.db.conversation_ports_adapters import SQLModelConversationAudit
 from infrastructure.event_bus.log_event_bus import log_event
 
 logger = logging.getLogger(__name__)
@@ -93,8 +95,9 @@ def _ensure_review_provider_profile() -> None:
 class OrchestratorRuntime:
     """Builds and runs the deep agent (orchestrator + aggregator in one)."""
 
-    def __init__(self, mcp_client) -> None:
+    def __init__(self, mcp_client, review_session_id: int | None = None) -> None:
         self._mcp_client = mcp_client
+        self._review_session_id = review_session_id
         self.capture = CaptureStore()
 
     async def run_review(self, review_input: AgentInput, agent_names: list[str]) -> ReviewResult:
@@ -119,12 +122,26 @@ class OrchestratorRuntime:
             TransientRetryMiddleware(),
         ]
 
+        # Root-agent tools: when historical conversation context is AVAILABLE
+        # (conversation_id supplied), grant the Context Agent's single read-only
+        # search_messages tool so the orchestrator can recall evidence BEFORE
+        # delegating. Recall is optional — the orchestrator decides — so the
+        # tool is only made reachable, never invoked on our behalf. When no
+        # conversation is supplied, the root gets NO tools (Phase 2 behavior).
+        # deepagents merges the `tools` argument additively with the built-in
+        # suite, so `task` is preserved; the harness profile still strips the
+        # filesystem/execute built-ins.
+        root_tools = await _build_root_tools(
+            review_input, self._mcp_client, self._review_session_id, self.capture
+        )
+
         agent = create_deep_agent(
             model=settings.review_model,
             system_prompt=system_prompt,
             subagents=subagent_specs or None,
             response_format=SubagentReport,
             middleware=root_middleware,
+            tools=root_tools,
         )
 
         result = await _run_with_retry(agent, user_message)
@@ -136,6 +153,38 @@ class OrchestratorRuntime:
             aggregated=_parse_aggregated(result),
             per_agent=_extract_per_agent(messages, self.capture),
         )
+
+
+async def _build_root_tools(
+    review_input: AgentInput, mcp_client, review_session_id: int | None, store: CaptureStore
+) -> list | None:
+    """Return the root agent's tools, or None for the no-conversation path.
+
+    A conversation_id only makes the Context Agent's search_messages tool
+    reachable; it never forces a recall (the orchestrator decides). When no
+    conversation is supplied, the root gets no tools and Phase 2 behavior is
+    preserved byte-for-byte. Returns None (not []) when the tool is
+    unavailable so callers can distinguish "no tools" from "tools withheld".
+
+    Identity (conversation_id/user_id/repo_id) is bound into the tool at
+    construction time (PHASE_3.md §9.5) — the LLM supplies only the query.
+    """
+    if review_input.conversation_id is None:
+        return None
+    if review_input.user_id is None:
+        return None  # defensive: the route 400s earlier (_validate_conversation_identity)
+    audited_context_tool = await get_audited_context_tool(
+        mcp_client,
+        conversation_id=review_input.conversation_id,
+        user_id=review_input.user_id,
+        repo_id=review_input.repo_id,
+        audit=SQLModelConversationAudit(),
+        review_session_id=review_session_id,
+        store=store,
+    )
+    if audited_context_tool is None:
+        return None
+    return [audited_context_tool]
 
 
 def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str:
@@ -160,49 +209,77 @@ def _build_user_message(review_input: AgentInput, agent_names: list[str]) -> str
             "",
             "Investigate, then synthesize the answer into a single SubagentReport JSON.",
         ]
-        return "\n".join(lines)
-
-    required = ", ".join(agent_names) if agent_names else "(none — answer directly)"
-    lines = [
-        f"Request type: {review_input.request_type}",
-        f"Repo: {review_input.repo_id}",
-        f"Graph commit hash: {review_input.graph_commit_hash}",
-        f"Repo root (local path): {review_input.repo_root}",
-        "",
-        "Subagents need BOTH the repo identifier (owner/name from `Repo:`) for "
-        "their GitHub tools AND the repo-root path (from `Repo root (local path):`) "
-        "for their CRG tools. Include both in every task description, never omit one.",
-        "",
-        "Required subagents for this request type (you MUST delegate to each):",
-        required,
-    ]
-    if review_input.request_type in _QUESTION_CARRYING_TYPES and review_input.question:
+        text = "\n".join(lines)
+    else:
+        required = ", ".join(agent_names) if agent_names else "(none — answer directly)"
+        lines = [
+            f"Request type: {review_input.request_type}",
+            f"Repo: {review_input.repo_id}",
+            f"Graph commit hash: {review_input.graph_commit_hash}",
+            f"Repo root (local path): {review_input.repo_root}",
+            "",
+            "Subagents need BOTH the repo identifier (owner/name from `Repo:`) for "
+            "their GitHub tools AND the repo-root path (from `Repo root (local path):`) "
+            "for their CRG tools. Include both in every task description, never omit one.",
+            "",
+            "Required subagents for this request type (you MUST delegate to each):",
+            required,
+        ]
+        if review_input.request_type in _QUESTION_CARRYING_TYPES and review_input.question:
+            lines.extend(
+                [
+                    "",
+                    "Question from the user:",
+                    review_input.question,
+                ]
+            )
+        diff_instructions = (
+            "The complete, unmodified diff for this review is appended automatically to every "
+            "task description by the system — you must not reproduce, summarize, abbreviate, "
+            "or reference the diff text yourself."
+            if review_input.diff_content
+            else "There is no separate diff parameter for this review: any diff content the user "
+            "supplied lives inside the 'Question from the user:' section above. Forward that "
+            "question verbatim into every task description so subagents see the exact diff."
+        )
         lines.extend(
             [
                 "",
-                "Question from the user:",
-                review_input.question,
+                diff_instructions,
+                "",
+                "Classify the request, delegate to every required subagent, then synthesize all "
+                "reports into a single SubagentReport JSON.",
             ]
         )
-    diff_instructions = (
-        "The complete, unmodified diff for this review is appended automatically to every "
-        "task description by the system — you must not reproduce, summarize, abbreviate, "
-        "or reference the diff text yourself."
-        if review_input.diff_content
-        else "There is no separate diff parameter for this review: any diff content the user "
-        "supplied lives inside the 'Question from the user:' section above. Forward that "
-        "question verbatim into every task description so subagents see the exact diff."
+        text = "\n".join(lines)
+
+    if review_input.conversation_id is not None:
+        text += "\n\n" + _conversation_context_block(review_input)
+    return text
+
+
+def _conversation_context_block(review_input: AgentInput) -> str:
+    """Prompt block declaring historical context AVAILABLE (never mandatory).
+
+    The orchestrator owns the recall decision (PHASE_3.md §6): conversation_id
+    only makes search_messages reachable. Identity is closure-bound into the
+    tool at construction time (§9.5), so the LLM no longer supplies — or sees —
+    conversation_id/user_id/repo_id; it only provides the search query. When
+    recall is warranted it must run BEFORE specialist delegation; results are
+    evidence with message_id provenance — never a ready-made answer — and the
+    most recent message wins on contradiction (§9.7).
+    """
+    return (
+        "Historical conversation context is AVAILABLE (optional, not mandatory). "
+        "The search_messages tool is pre-scoped to this conversation's identity — "
+        "do not pass conversation_id/user_id/repo_id; they are supplied for you. "
+        "You may call it ONLY if historical context is needed to answer this review; "
+        "it is never required and must never be called on every request. If you call "
+        "it, do so BEFORE delegating to subagents, treat the results as evidence "
+        "(never answer from a single snippet — reason over all of them), retain the "
+        "message_id of every hit you rely on, and when two recalled messages "
+        "contradict, prefer the most recent one."
     )
-    lines.extend(
-        [
-            "",
-            diff_instructions,
-            "",
-            "Classify the request, delegate to every required subagent, then synthesize all "
-            "reports into a single SubagentReport JSON.",
-        ]
-    )
-    return "\n".join(lines)
 
 
 def _index_task_calls(messages) -> dict[str, str]:

@@ -9,6 +9,8 @@ class AgentInput:
     diff_content: str | None = None
     repo_root: str = ""
     question: str | None = None
+    conversation_id: int | None = None  # historical context AVAILABLE (never mandatory recall)
+    user_id: str | None = None  # caller-supplied identity for search_messages authorization
 
 
 @dataclass

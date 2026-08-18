@@ -142,4 +142,9 @@ AGENT_TOOL_PLAN: Final[dict[str, dict[str, set[str] | None]]] = {
         "atlassian": ATLASSIAN_FIX_SUGGESTION,  # confluence read tools only — no Jira, no writes
         "context7": None,
     },
+    # Context Agent (Phase 3): granted exactly the read-only conversation recall
+    # tool — never a wildcard, never a write tool (PHASE_3.md §5/§8).
+    "context_agent": {
+        "conversation": CONVERSATION["context_agent"],
+    },
 }
