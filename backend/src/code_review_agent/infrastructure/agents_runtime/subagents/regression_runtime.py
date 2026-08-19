@@ -1,6 +1,10 @@
 """Regression subagent runtime: builds the deepagents SubAgent dict."""
 
 from infrastructure.agents_runtime.capture import CaptureStore, SubagentCaptureMiddleware
+from infrastructure.agents_runtime.memory_tools import (
+    build_private_memory_tools,
+    build_shared_memory_tools,
+)
 from infrastructure.agents_runtime.tool_scoping import load_prompt, scope_agent_tools
 
 
@@ -9,7 +13,11 @@ async def build_regression_spec(mcp_client, store: CaptureStore | None = None) -
         "name": "regression",
         "description": "Identifies blast radius and untested hotspots of a change",
         "system_prompt": load_prompt("regression"),
-        "tools": await scope_agent_tools(mcp_client, "regression", store),
+        "tools": (
+            await scope_agent_tools(mcp_client, "regression", store)
+            + build_shared_memory_tools()
+            + build_private_memory_tools("regression")
+        ),
     }
     if store is not None:
         spec["middleware"] = [SubagentCaptureMiddleware("regression", store)]

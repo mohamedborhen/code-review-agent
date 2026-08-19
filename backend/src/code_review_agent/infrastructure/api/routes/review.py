@@ -148,7 +148,9 @@ async def review(
     )
 
     orchestrator = OrchestratorRuntime(
-        request.app.state.mcp_client, review_session_id=session_id
+        request.app.state.mcp_client,
+        review_session_id=session_id,
+        memory_store=request.app.state.memory_store,
     )
 
     start = time.monotonic()

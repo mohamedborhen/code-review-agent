@@ -1,7 +1,9 @@
 """Review Orchestrator <-> Context Agent integration tests (Phase 3 decisions).
 
-Covers the build contract without a live LLM:
-  1. no conversation_id -> root gets NO tools (Phase 2 path unchanged)
+Covers the build contract without a live LLM (updated for Phase 4: the root is
+never tool-less — shared-memory tools are always granted; the Context Agent's
+search_messages is ADDITIONAL, granted only with a conversation_id):
+  1. no conversation_id -> root gets shared memory tools only (no search_messages)
   2. conversation_id without user_id -> 400
   3. server rejects identity (unknown conversation / not yours) -> not_found, no leak, review proceeds
   4. scope_agent_tools("context_agent") -> exactly ["search_messages"]
@@ -18,7 +20,7 @@ Covers the build contract without a live LLM:
   15. LLM-visible args_schema exposes ONLY query/limit/exclude_message_id
   16. E2E: seeded fact -> review cites it (live, run separately)
   17. full suite green (pytest)
-  18. get_tools raising (server down) -> build returns None, review proceeds
+  18. get_tools raising (server down) -> context tool withheld, memory tools remain
   19. context_available=False omits the AVAILABLE prompt block (tool withheld)
 
 Unit-testable subset runs here; live E2E is exercised via the running servers.
@@ -121,44 +123,49 @@ def _agent_input(**overrides) -> AgentInput:
 
 
 class BuildRootToolsTest(unittest.IsolatedAsyncioTestCase):
-    def test_no_conversation_id_grants_no_root_tools(self):
-        # Case 1: Phase 2 path unchanged — the root gets NO tools.
+    def test_no_conversation_id_grants_memory_tools_only(self):
+        # Phase 4: the root is NEVER tool-less — the shared memory tool pair is
+        # always granted. Without a conversation_id the Context Agent's
+        # search_messages is withheld (Phase 2's "no tools" path is superseded
+        # by the always-on shared-memory tools; see PHASE_4.md §6.2).
         client = _FakeMCPClient({"conversation": [_fake_search_tool()]})
         tools = asyncio.run(
             _build_root_tools(_agent_input(), client, None, CaptureStore())
         )
-        self.assertIsNone(tools)
+        self.assertEqual([t.name for t in tools], ["manage_memory", "search_memory"])
 
-    def test_conversation_id_grants_search_messages_only(self):
-        # Case 4: exactly one tool, named search_messages.
+    def test_conversation_id_grants_memory_plus_search_messages(self):
+        # Case 4: shared memory tools + exactly one context tool, search_messages.
         client = _FakeMCPClient({"conversation": [_fake_search_tool()]})
         tools = asyncio.run(
             _build_root_tools(
                 _agent_input(conversation_id=7, user_id="alice"), client, 42, CaptureStore()
             )
         )
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].name, "search_messages")
+        self.assertEqual(
+            [t.name for t in tools], ["manage_memory", "search_memory", "search_messages"]
+        )
 
-    def test_tool_unavailable_returns_none(self):
-        # Server down / not registered -> recall skipped, review proceeds.
+    def test_tool_unavailable_keeps_memory_tools(self):
+        # Server down / not registered -> context tool withheld, shared memory
+        # tools remain (root never tool-less), review proceeds.
         client = _FakeMCPClient({})
         tools = asyncio.run(
             _build_root_tools(
                 _agent_input(conversation_id=7, user_id="alice"), client, 42, CaptureStore()
             )
         )
-        self.assertIsNone(tools)
+        self.assertEqual([t.name for t in tools], ["manage_memory", "search_memory"])
 
-    def test_tool_server_down_returns_none(self):
-        # get_tools raises (real failure mode) -> recall skipped, no crash.
+    def test_tool_server_down_keeps_memory_tools(self):
+        # get_tools raises (real failure mode) -> context tool withheld, no crash.
         client = _UnavailableMCPClient()
         tools = asyncio.run(
             _build_root_tools(
                 _agent_input(conversation_id=7, user_id="alice"), client, 42, CaptureStore()
             )
         )
-        self.assertIsNone(tools)
+        self.assertEqual([t.name for t in tools], ["manage_memory", "search_memory"])
 
     def test_plan_entry_exactly_search_messages(self):
         self.assertEqual(

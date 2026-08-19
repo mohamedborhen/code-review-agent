@@ -7,6 +7,8 @@ pydantic-settings>=2.0.0
 code-review-graph>=2.3,<3
 deepagents>=0.7.1,<0.8
 langchain-mcp-adapters>=0.3.1,<0.4
+langmem>=0.0.30,<0.1
+langgraph-checkpoint-sqlite>=3.1,<4
 # LLM provider integrations for REVIEW_MODEL — only the one matching the
 # configured provider is actually required, but all are bundled so the system
 # can be switched between providers by changing the env var alone.
@@ -15,3 +17,4 @@ langchain-google-genai>=4.3,<5
 langchain-openai>=0.0.1
 langchain-groq>=0.0.1
 langchain-openrouter>=0.0.1
+langchain-nvidia-ai-endpoints>=1.4.3,<2

@@ -25,22 +25,19 @@ def _truncate(text: str, limit: int = 2000) -> str:
     return text if len(text) <= limit else text[:limit] + "...(truncated)"
 
 
-# Cap on the tool result that is fed BACK to the model. CRG calls
-# (get_review_context_tool with include_source, detect_changes_tool, ...) can
-# return tens of kilobytes of JSON; once returned, it sits in the conversation
-# history and is re-sent on every subsequent turn, compounding the token cost.
-# The event log keeps its own tighter cap (_truncate above); this one is what
-# the model actually sees.
-_TOOL_RESULT_MAX_CHARS = 4000
-
-
-def _truncate_result(result: object) -> object:
-    if isinstance(result, str):
-        return _truncate(result, _TOOL_RESULT_MAX_CHARS)
-    text = str(result)
-    if len(text) <= _TOOL_RESULT_MAX_CHARS:
-        return result
-    return text[:_TOOL_RESULT_MAX_CHARS] + "...(truncated)"
+# Truncation policy: the wrapper returns the tool result to the caller
+# UNTRUNCATED. Historically the result was capped at 4000 chars because it was
+# fed back to the model and re-sent on every subsequent turn (CRG calls can
+# return tens of kilobytes of JSON). That model-facing token-cap concern is now
+# owned by the Phase 4 in-context SummarizationMiddleware (222,822-token
+# trigger / 26,214-token keep, see orchestrator_runtime.py), so the wrapper no
+# longer truncates the returned value. The EVENT-LOG copy below still uses the
+# tighter _truncate() cap — the log is observational, not model input.
+#
+# This also fixes the Phase 3 audit bug: get_audited_context_tool json.loads()
+# the returned payload, so a successful recall whose JSON exceeded the old
+# 4000-char cap was misreported as status="invalid_response" / results_count=0
+# (PHASE_4.md §0.1).
 
 
 def _is_null_schema(node: object) -> bool:
@@ -148,7 +145,7 @@ def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | Non
             ts=ts,
             duration_ms=duration_ms,
         )
-        return _truncate_result(result)
+        return result
 
     return StructuredTool.from_function(
         coroutine=_wrapped,

@@ -85,6 +85,17 @@ class Settings(BaseSettings):
     # URL, so never hardcode 127.0.0.1 here.
     conversation_mcp_url: str = "http://127.0.0.1:9001/mcp"
 
+    # --- Phase 4 additions ---
+    # In-context summarization token budget for REVIEW_MODEL's 262,144-token
+    # context window (nvidia:nvidia/nemotron-3-ultra-550b-a55b). deepagents'
+    # built-in SummarizationMiddleware auto-detection falls back to a flat
+    # 170,000-token trigger when `model.profile` is `{}` — true for this model,
+    # which is absent from the NVIDIA static profile registry (PHASE_4.md §5.1).
+    # These constants configure the real window explicitly: the middleware
+    # triggers at 85% of the window (222,822 tokens) and keeps 10% (26,214).
+    summarization_trigger_tokens: int = 222822
+    summarization_keep_tokens: int = 26214
+
     @model_validator(mode="after")
     def resolve_relative_paths(self) -> "Settings":
         if not os.path.isabs(self.workspace_root):

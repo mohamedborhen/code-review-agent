@@ -25,11 +25,17 @@ from deepagents import (
     create_deep_agent,
     register_provider_profile,
 )
-from langchain_core.messages import AIMessage, ToolMessage
+from deepagents.backends.state import StateBackend
+from deepagents.middleware.summarization import SummarizationMiddleware
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages.utils import count_tokens_approximately
 
+from application.conversation_service.summarize_conversation import summarize_conversation
 from domain.entities.agent_finding import AgentFinding, AgentInput, AgentOutput, ReviewResult
 from infrastructure.agents_runtime.capture import CaptureStore
 from infrastructure.agents_runtime.harness_profile import ensure_review_harness_profile
+from infrastructure.agents_runtime.memory_tools import build_shared_memory_tools
 from infrastructure.agents_runtime.middleware import (
     DiffInjectionMiddleware,
     RootTimingMiddleware,
@@ -47,6 +53,7 @@ from infrastructure.agents_runtime.subagents.security_runtime import build_secur
 from infrastructure.agents_runtime.tool_scoping import load_prompt
 from infrastructure.config import settings
 from infrastructure.db.conversation_ports_adapters import SQLModelConversationAudit
+from infrastructure.db.conversation_repository import SQLModelConversationRepository
 from infrastructure.event_bus.log_event_bus import log_event
 
 logger = logging.getLogger(__name__)
@@ -95,9 +102,18 @@ def _ensure_review_provider_profile() -> None:
 class OrchestratorRuntime:
     """Builds and runs the deep agent (orchestrator + aggregator in one)."""
 
-    def __init__(self, mcp_client, review_session_id: int | None = None) -> None:
+    def __init__(
+        self,
+        mcp_client,
+        review_session_id: int | None = None,
+        memory_store=None,
+    ) -> None:
         self._mcp_client = mcp_client
         self._review_session_id = review_session_id
+        # The single process-wide AsyncSqliteStore built in main.py's lifespan.
+        # Passed to create_deep_agent(store=...) so the LangMem memory tools
+        # (constructed without store=) resolve it at runtime (PHASE_4.md §6.1).
+        self._memory_store = memory_store
         self.capture = CaptureStore()
 
     async def run_review(self, review_input: AgentInput, agent_names: list[str]) -> ReviewResult:
@@ -115,32 +131,54 @@ class OrchestratorRuntime:
 
         system_prompt = load_prompt("orchestrator") + "\n\n" + load_prompt("aggregator")
 
+        # One StateBackend shared by BOTH the agent graph and the explicit
+        # SummarizationMiddleware — deepagents' auto-built summarization reads
+        # the same backend for conversation-history offload, so splitting them
+        # would silently break that coupling (PHASE_4.md §5.2).
+        backend = StateBackend()
+
         root_middleware = [
             RootTimingMiddleware(self.capture),
             DiffInjectionMiddleware(review_input.diff_content),
+            # Explicit in-context summarization budget (PHASE_4.md §5.2): the
+            # configured model's `profile` is `{}`, so deepagents' auto-detection
+            # falls back to a flat 170k-token trigger. The model's real window is
+            # 262,144 tokens, so Phase 4 configures 85% / 10% explicitly. This
+            # instance REPLACES deepagents' auto-added one by name
+            # ("SummarizationMiddleware"), keeping exactly one summarization
+            # node in the compiled graph (verified, PHASE_4.md §9 Q1).
+            SummarizationMiddleware(
+                model=settings.review_model,
+                backend=backend,
+                trigger=("tokens", settings.summarization_trigger_tokens),
+                keep=("tokens", settings.summarization_keep_tokens),
+                token_counter=count_tokens_approximately,
+            ),
             TransientRetryMiddleware(),
         ]
 
-        # Root-agent tools: when historical conversation context is AVAILABLE
-        # (conversation_id supplied), grant the Context Agent's single read-only
-        # search_messages tool so the orchestrator can recall evidence BEFORE
-        # delegating. Recall is optional — the orchestrator decides — so the
-        # tool is only made reachable, never invoked on our behalf. When no
-        # conversation is supplied, the root gets NO tools (Phase 2 behavior).
-        # deepagents merges the `tools` argument additively with the built-in
-        # suite, so `task` is preserved; the harness profile still strips the
-        # filesystem/execute built-ins.
+        # Root-agent tools: the shared long-term memory tool pair is ALWAYS
+        # granted (every agent owns shared memory). When historical
+        # conversation context is AVAILABLE (conversation_id supplied), the
+        # Context Agent's single read-only search_messages tool is granted too,
+        # so the orchestrator can recall evidence BEFORE delegating. Recall is
+        # optional — the orchestrator decides — so the tool is only made
+        # reachable, never invoked on our behalf. deepagents merges the `tools`
+        # argument additively with the built-in suite, so `task` is preserved;
+        # the harness profile still strips the filesystem/execute built-ins.
         root_tools = await _build_root_tools(
             review_input, self._mcp_client, self._review_session_id, self.capture
         )
 
         # The conversation-context prompt block must match what the root agent
-        # was actually granted: only declare context AVAILABLE when the tool was
-        # successfully built (server up / registered). On the degraded path
-        # (server down) the tool is withheld, so the block is omitted too —
+        # was actually granted: only declare context AVAILABLE when the context
+        # tool was successfully built (server up / registered). On the degraded
+        # path (server down) the tool is withheld, so the block is omitted too —
         # otherwise the model is told it has a tool it does not (finding F2).
+        # The shared memory tools are always present but need no prompt block.
+        context_available = any(t.name == "search_messages" for t in root_tools)
         user_message = _build_user_message(
-            review_input, agent_names, context_available=root_tools is not None
+            review_input, agent_names, context_available=context_available
         )
 
         agent = create_deep_agent(
@@ -150,12 +188,41 @@ class OrchestratorRuntime:
             response_format=SubagentReport,
             middleware=root_middleware,
             tools=root_tools,
+            backend=backend,
+            store=self._memory_store,
         )
 
-        result = await _run_with_retry(agent, user_message)
+        # Identity flows ONLY via config.configurable (PHASE_4.md §6.2): the
+        # LangMem memory tools resolve their {user_id}/{repo_id} namespace
+        # placeholders from here at ainvoke time — never an LLM tool argument.
+        # Sourced from trusted AgentInput values (caller-supplied tenant keys,
+        # PHASE_4.md §2 "Identity source").
+        run_config = {
+            "configurable": {
+                "user_id": review_input.user_id or "anonymous",
+                "repo_id": review_input.repo_id,
+            }
+        }
+
+        result = await _run_with_retry(agent, user_message, config=run_config)
         messages = result.get("messages", [])
 
         await _emit_events(messages)
+
+        # Durable conversation summary (PHASE_4.md §5.3): persist a MemorySummary
+        # row via ConversationStorePort when this review ran against a
+        # conversation. Best-effort — it must NEVER fail the review (the
+        # summarize_conversation use-case has its own deterministic fallback for
+        # LLM failures; this outer try/except covers DB/message errors).
+        if review_input.conversation_id is not None:
+            try:
+                await _write_durable_conversation_summary(review_input)
+            except Exception as exc:  # noqa: BLE001 - summary must never fail the review
+                logger.warning(
+                    "Durable conversation summary failed for conversation %s: %s",
+                    review_input.conversation_id,
+                    exc,
+                )
 
         return ReviewResult(
             aggregated=_parse_aggregated(result),
@@ -165,22 +232,25 @@ class OrchestratorRuntime:
 
 async def _build_root_tools(
     review_input: AgentInput, mcp_client, review_session_id: int | None, store: CaptureStore
-) -> list | None:
-    """Return the root agent's tools, or None for the no-conversation path.
+) -> list:
+    """Return the root agent's tool list (never None — the root is never tool-less).
 
-    A conversation_id only makes the Context Agent's search_messages tool
-    reachable; it never forces a recall (the orchestrator decides). When no
-    conversation is supplied, the root gets no tools and Phase 2 behavior is
-    preserved byte-for-byte. Returns None (not []) when the tool is
-    unavailable so callers can distinguish "no tools" from "tools withheld".
+    The shared long-term memory tool pair (build_shared_memory_tools) is ALWAYS
+    included (PHASE_4.md §6.2): every agent in a conversation owns shared
+    memory. A conversation_id additionally makes the Context Agent's
+    search_messages tool reachable; it never forces a recall (the orchestrator
+    decides). The context tool is withheld (omitted, not returned as None) when
+    the conversation/server path is unavailable, so callers detect "context
+    withheld" by checking membership rather than None-vs-list semantics.
 
-    Identity (conversation_id/user_id/repo_id) is bound into the tool at
+    Identity (conversation_id/user_id/repo_id) is bound into the context tool at
     construction time (PHASE_3.md §9.5) — the LLM supplies only the query.
     """
+    tools = build_shared_memory_tools()
     if review_input.conversation_id is None:
-        return None
+        return tools
     if review_input.user_id is None:
-        return None  # defensive: the route 400s earlier (_validate_conversation_identity)
+        return tools  # defensive: the route 400s earlier (_validate_conversation_identity)
     audited_context_tool = await get_audited_context_tool(
         mcp_client,
         conversation_id=review_input.conversation_id,
@@ -190,9 +260,9 @@ async def _build_root_tools(
         review_session_id=review_session_id,
         store=store,
     )
-    if audited_context_tool is None:
-        return None
-    return [audited_context_tool]
+    if audited_context_tool is not None:
+        tools.append(audited_context_tool)
+    return tools
 
 
 def _build_user_message(
@@ -266,6 +336,58 @@ def _build_user_message(
     if review_input.conversation_id is not None and context_available:
         text += "\n\n" + _conversation_context_block(review_input)
     return text
+
+
+async def _write_durable_conversation_summary(review_input: AgentInput) -> None:
+    """Persist a durable MemorySummary for a review run (PHASE_4.md §5.3).
+
+    Runs AFTER the orchestrator run resolves successfully, when the review was
+    scoped to a conversation. Uses Phase 3's `ConversationStorePort`
+    implementation (SQLModelConversationRepository) and the upgraded
+    `summarize_conversation` use-case with an injected LLM summarizer built
+    around `settings.review_model`. The use-case falls back to its
+    deterministic tail summary on any LLM failure; the CALLER (run_review)
+    wraps this whole helper in try/except so DB/message errors also never fail
+    the review.
+
+    The message list is pre-fetched through asyncio.to_thread (sync SQLite, per
+    the async/sync boundary rule); the only in-loop sync SQLite left is the
+    use-case's own brief latest-message-id lookup + single MemorySummary INSERT.
+    """
+    store = SQLModelConversationRepository()
+    messages = await asyncio.to_thread(store.list_messages, review_input.conversation_id)
+    recent_messages = [m.content for m in messages if m and m.content]
+    if not recent_messages:
+        return
+    await summarize_conversation(
+        review_input.conversation_id,
+        store=store,
+        recent_messages=recent_messages,
+        llm_summarizer=_build_llm_summarizer(),
+    )
+
+
+def _build_llm_summarizer():
+    """Async ``list[str] -> str`` callable wrapping settings.review_model.
+
+    Constructs the model lazily (inside the callable) and summarizes the
+    plain-text message run with a short user prompt — no system-prompt
+    override needed. Any exception propagates to the use-case's fallback
+    (PHASE_4.md §5.3).
+    """
+
+    async def _summarize(recent_messages: list[str]) -> str:
+        model = init_chat_model(settings.review_model)
+        prompt = (
+            "Summarize this review session concisely. Cover the user's request, "
+            "the evidence reviewed, and the conclusions reached.\n\n"
+            + "\n".join(f"- {m}" for m in recent_messages)
+        )
+        response = await model.ainvoke([HumanMessage(content=prompt)])
+        content = response.content
+        return content if isinstance(content, str) else str(content)
+
+    return _summarize
 
 
 def _conversation_context_block(review_input: AgentInput) -> str:
@@ -411,8 +533,12 @@ _STRING_CONFIDENCE: dict[str, float] = {
 _STRUCTURED_OUTPUT_FAILURE = re.compile(r"structured output|json|parse", re.IGNORECASE)
 
 
-async def _run_with_retry(agent, user_message: str, attempts: int = 3) -> dict:
+async def _run_with_retry(agent, user_message: str, config: dict | None = None, attempts: int = 3) -> dict:
     """Run the deep agent, retrying transient + structured-output failures.
+
+    ``config`` is the run config carrying ``config.configurable`` identity
+    (user_id/repo_id) that the LangMem memory tools resolve their namespace
+    placeholders from (PHASE_4.md §6.2).
 
     Two failure classes are retried, each with a cadence matching its nature:
 
@@ -430,7 +556,10 @@ async def _run_with_retry(agent, user_message: str, attempts: int = 3) -> dict:
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return await agent.ainvoke({"messages": [{"role": "user", "content": user_message}]})
+            return await agent.ainvoke(
+                {"messages": [{"role": "user", "content": user_message}]},
+                config=config,
+            )
         except Exception as exc:  # noqa: BLE001 - deliberate broad catch for retry classification
             last = exc
             transient = _is_transient_provider_error(exc)

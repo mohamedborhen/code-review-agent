@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from infrastructure.agents_runtime.memory_store import build_memory_store
 from infrastructure.api.routes.conversation import router as conversation_router
 from infrastructure.api.routes.review import router as review_router
 from infrastructure.api.routes.webhooks import router as webhook_router
@@ -28,6 +29,14 @@ async def lifespan(app: FastAPI):
     logger.info("CRG server is reachable")
     app.state.mcp_client = build_mcp_client()
     logger.info("Shared MultiServerMCPClient built on app.state")
+    # Phase 4: the single process-wide LangGraph BaseStore for agent long-term
+    # memory. Exactly ONE AsyncSqliteStore exists per process, constructed HERE
+    # inside the async lifespan (the constructor captures asyncio.get_running_loop(),
+    # so it cannot be built at module import — PHASE_4.md §6.3). Every runtime
+    # that needs it (OrchestratorRuntime) receives this same instance via
+    # app.state.memory_store; no second store is ever constructed.
+    app.state.memory_store = await build_memory_store()
+    logger.info("Shared AsyncSqliteStore built on app.state.memory_store")
     # Branch-aware worktree eviction (§11): run off the event loop on startup so
     # the app comes up promptly; it evicts LRU worktrees only when over budget.
     try:
