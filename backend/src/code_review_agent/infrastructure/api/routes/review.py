@@ -167,6 +167,14 @@ async def review(
     finally:
         duration_ms = int((time.monotonic() - start) * 1000)
 
+    # Durable conversation summary (PHASE_4.md §5.3) runs as a FastAPI
+    # BackgroundTask AFTER the response is sent, so the summary LLM call never
+    # extends this request's latency (review finding F2, deviation D-P4-4).
+    # Best-effort by construction: the guard in OrchestratorRuntime logs any
+    # failure and a summary failure can never fail the review.
+    if review_input.conversation_id is not None:
+        background_tasks.add_task(orchestrator.write_durable_conversation_summary, review_input)
+
     await asyncio.to_thread(_record_executions, session_id, outcome, duration_ms, orchestrator.capture)
 
     timeline = orchestrator.capture.consume_timeline()

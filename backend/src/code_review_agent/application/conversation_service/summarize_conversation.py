@@ -9,6 +9,7 @@ already in this module — a memory-summary failure must never fail the review
 (PHASE_4.md §5.3).
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from application.conversation_service.ports import ConversationStorePort
@@ -38,15 +39,18 @@ async def summarize_conversation(
     if not recent_messages:
         return None
 
-    up_to_id = _latest_message_id(store, conversation_id)
+    # Sync SQLite persistence calls are offloaded via asyncio.to_thread per the
+    # async/sync boundary rule (AGENTS.md), matching run_conversation_turn.py.
+    up_to_id = await asyncio.to_thread(_latest_message_id, store, conversation_id)
     summary_text = await _summarize_with_fallback(recent_messages, llm_summarizer)
 
-    return store.add_memory_summary(
+    return await asyncio.to_thread(
+        store.add_memory_summary,
         MemorySummary(
             conversation_id=conversation_id,
             summary_text=summary_text,
             summarized_up_to_message_id=up_to_id,
-        )
+        ),
     )
 
 

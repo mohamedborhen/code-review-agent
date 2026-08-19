@@ -487,3 +487,58 @@ def test_durable_summary_helper_raises_on_db_error() -> None:
                 await orchestrator_module._write_durable_conversation_summary(review_input)
 
     asyncio.run(main())
+
+
+def test_llm_summarizer_applies_review_profile_kwargs() -> None:
+    """_build_llm_summarizer must apply the same max_tokens/timeout init kwargs
+    the deepagents ProviderProfile registers (_ensure_review_provider_profile) —
+    that profile only applies to models resolved THROUGH create_deep_agent, and
+    the summarizer bypasses that path (review finding F1). Without them the free
+    tier rejects the full output window (silent deterministic fallback) and a
+    hung provider is never bounded by review_timeout."""
+    from types import SimpleNamespace
+
+    async def main() -> None:
+        fake_model = mock.MagicMock()
+        fake_model.ainvoke = mock.AsyncMock(return_value=SimpleNamespace(content="ok"))
+        with mock.patch.object(
+            orchestrator_module, "init_chat_model", return_value=fake_model
+        ) as init_model:
+            summarize = orchestrator_module._build_llm_summarizer()
+            await summarize(["first message"])
+
+        _, kwargs = init_model.call_args
+        assert kwargs["max_tokens"] == settings.review_max_tokens
+        assert kwargs["timeout"] == settings.review_timeout
+
+    asyncio.run(main())
+
+
+def test_write_durable_summary_guard_swallows_db_errors() -> None:
+    """OrchestratorRuntime.write_durable_conversation_summary is the guard the
+    review route schedules as a BackgroundTask: a DB error inside the helper
+    (which still raises, pinned by the helper contract test above) is absorbed
+    and logged here, so the background task never surfaces an unhandled
+    exception and a summary failure NEVER fails the review (finding F2)."""
+    from domain.entities.agent_finding import AgentInput
+
+    review_input = AgentInput(
+        repo_id="acme/repo",
+        graph_commit_hash="abc123",
+        request_type="any_question",
+        conversation_id=1,
+        user_id="alice",
+    )
+
+    async def main() -> None:
+        orchestrator = orchestrator_module.OrchestratorRuntime(
+            mcp_client=mock.MagicMock(), memory_store=None
+        )
+        with mock.patch.object(
+            orchestrator_module, "_write_durable_conversation_summary"
+        ) as helper:
+            helper.side_effect = RuntimeError("db is locked")
+            # Guard returns None; no exception surfaces to the caller.
+            assert await orchestrator.write_durable_conversation_summary(review_input) is None
+
+    asyncio.run(main())

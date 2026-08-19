@@ -209,25 +209,38 @@ class OrchestratorRuntime:
 
         await _emit_events(messages)
 
-        # Durable conversation summary (PHASE_4.md §5.3): persist a MemorySummary
-        # row via ConversationStorePort when this review ran against a
-        # conversation. Best-effort — it must NEVER fail the review (the
-        # summarize_conversation use-case has its own deterministic fallback for
-        # LLM failures; this outer try/except covers DB/message errors).
-        if review_input.conversation_id is not None:
-            try:
-                await _write_durable_conversation_summary(review_input)
-            except Exception as exc:  # noqa: BLE001 - summary must never fail the review
-                logger.warning(
-                    "Durable conversation summary failed for conversation %s: %s",
-                    review_input.conversation_id,
-                    exc,
-                )
-
+        # Durable conversation summary (PHASE_4.md §5.3) is NOT awaited here:
+        # the composition root (review route) schedules it as a FastAPI
+        # BackgroundTask via write_durable_conversation_summary() so the summary
+        # LLM call never extends the API response time. A background failure can
+        # only be logged by that guard, never fail the review (review finding
+        # F2, deviation D-P4-4).
         return ReviewResult(
             aggregated=_parse_aggregated(result),
             per_agent=_extract_per_agent(messages, self.capture),
         )
+
+    async def write_durable_conversation_summary(self, review_input: AgentInput) -> None:
+        """Persist a durable MemorySummary for a conversation-scoped review run.
+
+        Scheduled by the review route as a FastAPI BackgroundTask AFTER the
+        response is sent (PHASE_4.md §5.3; placement moved off the request path
+        per review finding F2, deviation D-P4-4). The module-level helper may
+        raise (test-pinned contract, test_memory_phase4.py:464); this guard
+        absorbs DB/message errors so the background task never surfaces an
+        unhandled exception and a memory-summary failure NEVER fails the
+        review. No-op when the review was not scoped to a conversation.
+        """
+        if review_input.conversation_id is None:
+            return
+        try:
+            await _write_durable_conversation_summary(review_input)
+        except Exception as exc:  # noqa: BLE001 - summary must never fail the review
+            logger.warning(
+                "Durable conversation summary failed for conversation %s: %s",
+                review_input.conversation_id,
+                exc,
+            )
 
 
 async def _build_root_tools(
@@ -374,10 +387,22 @@ def _build_llm_summarizer():
     plain-text message run with a short user prompt — no system-prompt
     override needed. Any exception propagates to the use-case's fallback
     (PHASE_4.md §5.3).
+
+    The ProviderProfile registered by ``_ensure_review_provider_profile`` only
+    applies to models resolved THROUGH deepagents (create_deep_agent) — this
+    call bypasses that path, so the same ``max_tokens``/``timeout`` init kwargs
+    are applied explicitly (review finding F1): without ``max_tokens`` the
+    OpenRouter free tier rejects the full output window and the summary
+    silently degrades to the deterministic fallback; without ``timeout`` a hung
+    provider could hold the request open past ``review_timeout``.
     """
 
     async def _summarize(recent_messages: list[str]) -> str:
-        model = init_chat_model(settings.review_model)
+        model = init_chat_model(
+            settings.review_model,
+            max_tokens=settings.review_max_tokens,
+            timeout=settings.review_timeout,
+        )
         prompt = (
             "Summarize this review session concisely. Cover the user's request, "
             "the evidence reviewed, and the conclusions reached.\n\n"
