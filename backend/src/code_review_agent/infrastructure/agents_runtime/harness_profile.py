@@ -30,6 +30,7 @@ from deepagents import (
 from deepagents._models import get_model_identifier, get_model_provider
 from langchain.chat_models import init_chat_model
 
+from infrastructure.agents_runtime.middleware import NemotronNameParametersToolCallParser
 from infrastructure.config import settings
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ def ensure_review_harness_profile() -> None:
     profile = HarnessProfile(
         excluded_tools=_BUILTIN_TOOLS,
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        extra_middleware=[NemotronNameParametersToolCallParser()],
     )
     for key in _harness_profile_keys():
         register_harness_profile(key, profile)

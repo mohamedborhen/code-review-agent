@@ -64,13 +64,21 @@ def _namespace_template_of(tool):
     """Pull the LangMem NamespaceTemplate out of a memory tool's closure.
 
     langmem binds the template as a closure cell; locating it by type (instead
-    of a positional index) keeps the test robust across tool kinds.
+    of a positional index) keeps the test robust across tool kinds. Since the
+    P2 harden wrapper (memory_tools._harden_manage_memory_tool) re-wraps the
+    manage tool in a StructuredTool, the template can sit one level deeper — a
+    cell holding another tool is unwrapped and re-scanned.
     """
     from langmem.utils import NamespaceTemplate
 
-    for cell in getattr(tool.coroutine, "__closure__", ()) or ():
-        if isinstance(cell.cell_contents, NamespaceTemplate):
-            return cell.cell_contents
+    stack = [tool]
+    while stack:
+        current = stack.pop()
+        for cell in getattr(current.coroutine, "__closure__", ()) or ():
+            if isinstance(cell.cell_contents, NamespaceTemplate):
+                return cell.cell_contents
+            if isinstance(cell.cell_contents, StructuredTool):
+                stack.append(cell.cell_contents)
     raise AssertionError(f"no NamespaceTemplate in {tool.name} closure")
 
 
@@ -150,6 +158,94 @@ def test_memory_tools_resolve_phase4_namespaces() -> None:
     private_manage, private_search = (_namespace_template_of(t)(config) for t in private)
     assert private_manage == ("memories", "private", "alice", "acme/repo", "security")
     assert private_search == ("memories", "private", "alice", "acme/repo", "security")
+
+
+def test_manage_memory_contract_explicit() -> None:
+    """P4 steering: the hardened manage_memory tool must advertise the
+    create-needs-content rule in BOTH its description and its args_schema — the
+    two surfaces the model reads when picking arguments. A regression here means
+    the contract text (memory_tools._MANAGE_MEMORY_DESCRIPTION /
+    _ManageMemoryArgs) was weakened or reverted to langmem's optional-content
+    default."""
+    from infrastructure.agents_runtime.memory_tools import build_shared_memory_tools
+
+    manage = build_shared_memory_tools()[0]
+    assert manage.name == "manage_memory"
+
+    desc = manage.description
+    assert "content is REQUIRED" in desc
+    assert "NEVER" in desc
+    assert "create" in desc
+
+    schema = manage.args_schema.model_json_schema()
+    content_desc = schema["properties"]["content"]["description"].lower()
+    assert "mandatory" in content_desc and "create" in content_desc
+    id_desc = schema["properties"]["id"]["description"].lower()
+    assert "only for update/delete" in id_desc and "never" in id_desc
+
+
+def test_manage_memory_create_dedups_exact_content() -> None:
+    """P3/3b: repeated identical create calls must be idempotent — the wrapper
+    returns the existing memory's id instead of persisting a duplicate row
+    (E2E S3 stored the same fact three times). Different content still creates."""
+    async def main() -> None:
+        from langmem import create_manage_memory_tool
+        import langgraph.config as lgconfig
+        from infrastructure.agents_runtime.memory_tools import _harden_manage_memory_tool
+
+        store, conn = await _in_memory_store()
+        try:
+            ns = ("memories", "shared", "{user_id}", "{repo_id}")
+            hardened = _harden_manage_memory_tool(create_manage_memory_tool(ns, store=store))
+
+            class _RT:  # minimal PregelRuntime stand-in exposing .store
+                def __init__(self, st):
+                    self.store = st
+
+            # The wrapper + langmem resolve store + identity from the LangGraph
+            # runtime context (get_store/get_config) — set the real contextvar
+            # the way a graph run would, instead of mocking.
+            cfg = {
+                "configurable": {
+                    "user_id": "alice",
+                    "repo_id": "acme/repo",
+                    "__pregel_runtime": _RT(store),
+                }
+            }
+            token = lgconfig.var_child_runnable_config.set(cfg)
+            try:
+                first = await hardened.coroutine(content="FACT alpha", action="create")
+                second = await hardened.coroutine(content="FACT alpha", action="create")
+                third = await hardened.coroutine(content="FACT beta", action="create")
+            finally:
+                lgconfig.var_child_runnable_config.reset(token)
+
+            assert first.startswith("created memory")
+            assert "already stored" in second
+            assert first.split()[-1] == second.split()[-1]  # same id returned
+            assert "created memory" in third  # different content still creates
+
+            items = await store.asearch(("memories", "shared", "alice", "acme/repo"))
+            assert sorted(item.value["content"] for item in items) == [
+                "FACT alpha",
+                "FACT beta",
+            ]
+        finally:
+            await conn.close()
+
+    asyncio.run(main())
+
+
+def test_orchestrator_prompt_scopes_memory_writes() -> None:
+    """P5: the orchestrator prompt must tell the root agent to DELEGATE
+    private-store requests instead of writing them itself to its shared
+    memory tool (E2E S5 leaked a PRIVATE-FACT into shared memory)."""
+    from infrastructure.agents_runtime.tool_scoping import load_prompt
+
+    prompt = load_prompt("orchestrator")
+    assert "SHARED memory only" in prompt
+    assert "PRIVATE memory" in prompt
+    assert "do NOT call `manage_memory` yourself" in prompt
 
 
 # --------------------------------------------------------------------------- #
