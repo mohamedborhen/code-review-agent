@@ -129,6 +129,8 @@ class SQLModelRepoWorkspaceRepository:
         error_message: str | None,
     ) -> None:
         """Write a GraphSnapshot row so graph readiness can be queried."""
+        from datetime import datetime, timezone
+
         from infrastructure.db.models import GraphSnapshot
 
         with Session(engine) as session:
@@ -138,6 +140,7 @@ class SQLModelRepoWorkspaceRepository:
                     commit_hash=commit_hash,
                     status=status,
                     error_message=error_message,
+                    completed_at=datetime.now(timezone.utc) if status == "ready" else None,
                 )
             )
             session.commit()

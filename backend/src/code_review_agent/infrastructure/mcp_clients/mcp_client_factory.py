@@ -22,9 +22,17 @@ Safety notes (do not relax):
   crashing the review.
 """
 
+import asyncio
+import logging
+
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from infrastructure.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Prevent concurrent rebuilds when multiple requests hit a dead server at once.
+_rebuild_lock = asyncio.Lock()
 
 
 def build_mcp_client() -> MultiServerMCPClient:
@@ -62,6 +70,24 @@ def build_mcp_client() -> MultiServerMCPClient:
             },
         }
     )
+
+
+async def rebuild_mcp_client() -> MultiServerMCPClient:
+    """Build a fresh MultiServerMCPClient and verify atlassian connectivity.
+
+    Called by the review route (D-12) when the health probe fails.  Uses a
+    lock to prevent concurrent rebuilds from multiple concurrent requests.
+    On success returns the new client; on failure returns a newly-built
+    client anyway (tools will be skipped by scope_agent_tools' degraded path).
+    """
+    async with _rebuild_lock:
+        new_client = build_mcp_client()
+        try:
+            await new_client.get_tools(server_name="atlassian")
+            logger.info("MCP client rebuilt — atlassian reachable")
+        except Exception:
+            logger.warning("MCP client rebuilt — atlassian still unreachable (degraded mode)")
+        return new_client
 
 
 def scoped(tools: list, allowed_names: set[str]) -> list:

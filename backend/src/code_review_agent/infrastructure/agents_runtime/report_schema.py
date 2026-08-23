@@ -10,7 +10,7 @@ propagates it to each subagent, so every subagent's ToolMessage content is the
 JSON serialization of a SubagentReport.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class FindingItem(BaseModel):
@@ -20,6 +20,15 @@ class FindingItem(BaseModel):
     description: str
     evidence: list[str] = Field(default_factory=list)
     recommendation: str = ""
+
+    @model_validator(mode="after")
+    def _cap_confidence_on_empty_evidence(self) -> "FindingItem":
+        """Downgrade high-confidence findings that have no evidence."""
+        if not self.evidence and self.confidence > 0.5:
+            self.confidence = min(self.confidence, 0.3)
+            if not self.title.startswith("(unverified)"):
+                self.title = f"(unverified) {self.title}"
+        return self
 
 
 class SubagentReport(BaseModel):

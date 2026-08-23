@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     )
 
     github_webhook_secret: str
-    crg_server_url: str = "http://localhost:5555/mcp"
+    crg_server_url: str = "http://127.0.0.1:5555/mcp"
     workspace_root: str = "./data/workspaces"
     metadata_db_path: str = "./data/phase1_metadata.db"
 

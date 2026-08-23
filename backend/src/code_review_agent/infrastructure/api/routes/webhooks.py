@@ -110,6 +110,7 @@ def process_webhook(repo_id: str, branch: str, commit_sha: str) -> None:
                 commit_hash=commit_sha,
                 status=status,
                 error_message=error_message,
+                completed_at=datetime.now(timezone.utc) if status == "ready" else None,
             )
             session.add(snapshot)
 
@@ -228,6 +229,7 @@ def register_and_build(repo_url: str, repo_id: str) -> None:
                 commit_hash=commit_hash,
                 status=status,
                 error_message=error_message,
+                completed_at=datetime.now(timezone.utc) if status == "ready" else None,
             )
             session.add(snapshot)
             session.commit()

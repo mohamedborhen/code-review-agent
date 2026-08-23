@@ -147,6 +147,19 @@ async def review(
         user_id=body.user_id,
     )
 
+    # D-12: lightweight MCP health probe.  If atlassian (or any server) died
+    # since the last request, the static client holds stale sessions.  Rebuild
+    # the client so subsequent get_tools() calls connect fresh.  The probe is
+    # intentionally cheap — a single get_tools() call that succeeds or fails
+    # fast; full tool acquisition happens later inside scope_agent_tools.
+    try:
+        await request.app.state.mcp_client.get_tools(server_name="atlassian")
+    except Exception:
+        logger.warning("Atlassian MCP unreachable — rebuilding client (D-12)")
+        from infrastructure.mcp_clients.mcp_client_factory import rebuild_mcp_client
+
+        request.app.state.mcp_client = await rebuild_mcp_client()
+
     orchestrator = OrchestratorRuntime(
         request.app.state.mcp_client,
         review_session_id=session_id,

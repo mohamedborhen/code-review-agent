@@ -215,8 +215,10 @@ class OrchestratorRuntime:
         # LLM call never extends the API response time. A background failure can
         # only be logged by that guard, never fail the review (review finding
         # F2, deviation D-P4-4).
+        aggregated = _parse_aggregated(result)
+        _enforce_evidence_discipline(aggregated)
         return ReviewResult(
-            aggregated=_parse_aggregated(result),
+            aggregated=aggregated,
             per_agent=_extract_per_agent(messages, self.capture),
         )
 
@@ -468,6 +470,22 @@ def _to_agent_output(report: SubagentReport) -> AgentOutput:
     return AgentOutput(agent_name=report.agent_name, findings=findings)
 
 
+def _enforce_evidence_discipline(output: AgentOutput) -> AgentOutput:
+    """Post-process findings: cap confidence on empty evidence, flag unverified.
+
+    This is the programmatic backstop for the aggregator prompt's instruction
+    to verify evidence.  The FindingItem pydantic validator handles schema-
+    level enforcement; this function handles the domain-level AgentOutput
+    after conversion from SubagentReport.
+    """
+    for f in output.findings:
+        if not f.evidence and f.confidence > 0.5:
+            f.confidence = min(f.confidence, 0.3)
+            if not f.title.startswith("(unverified)"):
+                f.title = f"(unverified) {f.title}"
+    return output
+
+
 def _parse_aggregated(result: dict) -> AgentOutput:
     structured = result.get("structured_response")
     if isinstance(structured, SubagentReport):
@@ -500,7 +518,21 @@ def _parse_aggregated(result: dict) -> AgentOutput:
     if from_messages is not None:
         return from_messages
     logger.warning("No structured_response in orchestrator result; returning empty aggregated output")
-    return AgentOutput(agent_name="aggregator")
+    return AgentOutput(
+        agent_name="aggregator",
+        findings=[AgentFinding(
+            severity="warning",
+            confidence=0.0,
+            title="Aggregator structured output parsing failed",
+            description=(
+                "The orchestrator's synthesis could not be parsed as a "
+                "SubagentReport. The aggregated findings are unavailable."
+            ),
+            evidence=["parse_status=parse_failed"],
+            recommendation="Retry the review.",
+        )],
+        parse_status="parse_failed",
+    )
 
 
 def _parse_aggregated_from_messages(result: dict) -> AgentOutput | None:
@@ -545,7 +577,21 @@ def _parse_tool_message(agent_name: str, content) -> AgentOutput:
         return _to_agent_output(report)
     except Exception:
         logger.warning("Could not parse structured subagent output for %s", agent_name)
-        return AgentOutput(agent_name=agent_name)
+        return AgentOutput(
+            agent_name=agent_name,
+            findings=[AgentFinding(
+                severity="warning",
+                confidence=0.0,
+                title=f"{agent_name}: structured output parsing failed",
+                description=(
+                    "The subagent produced output that could not be parsed as a "
+                    "SubagentReport. Review the raw tool output in the event log."
+                ),
+                evidence=["parse_status=parse_failed"],
+                recommendation="Retry the review or inspect the subagent's raw output.",
+            )],
+            parse_status="parse_failed",
+        )
 
 
 _STRING_CONFIDENCE: dict[str, float] = {
@@ -556,16 +602,22 @@ _STRING_CONFIDENCE: dict[str, float] = {
 }
 
 _STRUCTURED_OUTPUT_FAILURE = re.compile(r"structured output|json|parse", re.IGNORECASE)
+_MCP_ERROR = re.compile(r"ExceptionGroup|MCP|mcp|streamable|connection|transport", re.IGNORECASE)
+
+
+def _is_mcp_error(exc: BaseException) -> bool:
+    """Detect MCP transport/connection failures (D-12)."""
+    return bool(_MCP_ERROR.search(str(exc)))
 
 
 async def _run_with_retry(agent, user_message: str, config: dict | None = None, attempts: int = 3) -> dict:
-    """Run the deep agent, retrying transient + structured-output failures.
+    """Run the deep agent, retrying transient + structured-output + MCP failures.
 
     ``config`` is the run config carrying ``config.configurable`` identity
     (user_id/repo_id) that the LangMem memory tools resolve their namespace
     placeholders from (PHASE_4.md §6.2).
 
-    Two failure classes are retried, each with a cadence matching its nature:
+    Three failure classes are retried, each with a cadence matching its nature:
 
     - Provider-transient errors (429 / 5xx / rate limit / quota / socket
       timeout) — exponential backoff. These are mostly absorbed earlier by
@@ -575,6 +627,9 @@ async def _run_with_retry(agent, user_message: str, config: dict | None = None, 
       during E2E, where the configured model returns an empty/invalid native
       structured output that deepagents surfaces as a parse error) — short
       delay, since they are not quota-bound.
+    - MCP transport failures (ExceptionGroup from dead MCP servers, e.g.
+      atlassian crash D-12) — short delay, since the server may have been
+      restarted between attempts.
 
     Everything else propagates immediately.
     """
@@ -589,15 +644,21 @@ async def _run_with_retry(agent, user_message: str, config: dict | None = None, 
             last = exc
             transient = _is_transient_provider_error(exc)
             structured = bool(_STRUCTURED_OUTPUT_FAILURE.search(str(exc)))
-            if not (transient or structured):
+            mcp = _is_mcp_error(exc)
+            if not (transient or structured or mcp):
                 raise
             if attempt < attempts:
-                delay = (2.0 * (2 ** (attempt - 1)) + 0.5) if transient else 0.5
+                if transient:
+                    delay = 2.0 * (2 ** (attempt - 1)) + 0.5
+                elif mcp:
+                    delay = 1.0
+                else:
+                    delay = 0.5
                 logger.warning(
                     "Retrying review run (attempt %s/%s) after %s: %s",
                     attempt,
                     attempts,
-                    "transient provider error" if transient else "structured-output failure",
+                    "transient provider error" if transient else "MCP transport error" if mcp else "structured-output failure",
                     exc,
                 )
                 await asyncio.sleep(delay)

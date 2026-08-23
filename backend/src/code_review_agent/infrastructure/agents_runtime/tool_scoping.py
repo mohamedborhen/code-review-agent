@@ -1,8 +1,11 @@
 """Shared tool-scoping + prompt loading for the agents_runtime package."""
 
+import logging
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
@@ -158,13 +161,27 @@ def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | Non
 
 
 async def scope_agent_tools(mcp_client, agent_name: str, store: CaptureStore | None = None) -> list[BaseTool]:
-    """Fetch tools from the shared client and scope them to the agent's plan."""
+    """Fetch tools from the shared client and scope them to the agent's plan.
+
+    D-12 resilience: if an MCP server is unreachable (e.g. atlassian crash),
+    log a warning and skip that server's tools rather than propagating the
+    ExceptionGroup up and failing the entire review.  The agent degrades
+    gracefully — it still runs with its remaining tools (memory, CRG, GitHub).
+    """
     plan = AGENT_TOOL_PLAN[agent_name]
     tools: list[BaseTool] = []
     for server_name, allowed in plan.items():
         if allowed == set():
             continue
-        server_tools = await mcp_client.get_tools(server_name=server_name)
+        try:
+            server_tools = await mcp_client.get_tools(server_name=server_name)
+        except Exception:
+            logger.warning(
+                "MCP server %s unreachable — skipping tools for %s",
+                server_name,
+                agent_name,
+            )
+            continue
         if allowed is None:
             tools.extend(_wrap_with_events(t, agent_name, store) for t in server_tools)
             continue
