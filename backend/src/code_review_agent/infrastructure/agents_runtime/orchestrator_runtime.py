@@ -45,6 +45,7 @@ from infrastructure.agents_runtime.middleware import (
 )
 from infrastructure.agents_runtime.report_parse import extract_json_text as _extract_json
 from infrastructure.agents_runtime.utils import findings_list as _findings_list
+from infrastructure.agents_runtime.utils import truncate as _truncate
 from infrastructure.agents_runtime.report_schema import FindingItem, SubagentReport
 from infrastructure.agents_runtime.subagents.compliance_runtime import build_compliance_spec
 from infrastructure.agents_runtime.subagents.context_agent_runtime import get_audited_context_tool
