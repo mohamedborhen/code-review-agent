@@ -13,6 +13,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel
 
 from infrastructure.agents_runtime.capture import CaptureStore
+from infrastructure.agents_runtime.utils import truncate as _truncate
 from infrastructure.agents_runtime.tool_descriptions import TOOL_DESCRIPTION_OVERRIDES
 from infrastructure.agents_runtime.tool_lists import AGENT_TOOL_PLAN
 from infrastructure.db.models import ReviewToolCall
@@ -25,10 +26,6 @@ _PROMPTS_DIR = Path(__file__).parent / "prompts"
 def load_prompt(name: str) -> str:
     """Load a system prompt from prompts/<name>.md."""
     return (_PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
-
-
-def _truncate(text: str, limit: int = 2000) -> str:
-    return text if len(text) <= limit else text[:limit] + "...(truncated)"
 
 
 # Truncation policy: the wrapper returns the tool result to the caller

@@ -44,6 +44,7 @@ from infrastructure.agents_runtime.middleware import (
     _is_transient_provider_error,
 )
 from infrastructure.agents_runtime.report_parse import extract_json_text as _extract_json
+from infrastructure.agents_runtime.utils import findings_list as _findings_list
 from infrastructure.agents_runtime.report_schema import FindingItem, SubagentReport
 from infrastructure.agents_runtime.subagents.compliance_runtime import build_compliance_spec
 from infrastructure.agents_runtime.subagents.context_agent_runtime import get_audited_context_tool
@@ -777,29 +778,6 @@ def _coerce_finding(item: dict) -> FindingItem:
     )
 
 
-def _findings_list(raw: dict) -> list | None:
-    """Locate the findings array under any of the shapes subagents emit.
-
-    Subagents nest reports under domain keys (``security_review``,
-    ``compliance_report``, ...) and vary the array name (``findings``,
-    ``violations``, ``security_findings``, ...). Recurse one level into nested
-    dicts so a report like ``{"security_review": {"findings": [...]}}`` parses.
-    """
-    for key in ("findings", "violations"):
-        value = raw.get(key)
-        if isinstance(value, list):
-            return value
-    for key, value in raw.items():
-        if key.endswith("findings") and isinstance(value, list):
-            return value
-    for value in raw.values():
-        if isinstance(value, dict):
-            nested = _findings_list(value)
-            if nested is not None:
-                return nested
-    return None
-
-
 def _coerce_report(text: str, agent_name: str) -> SubagentReport:
     raw = json.loads(text)
     if isinstance(raw, list):
@@ -873,10 +851,6 @@ def _extract_per_agent(messages, capture: CaptureStore) -> list[AgentOutput]:
                 logger.warning("Could not coerce stashed report for %s", agent_name)
         outputs.append(output)
     return outputs
-
-
-def _truncate(text: str, limit: int = 2000) -> str:
-    return text if len(text) <= limit else text[:limit] + "...(truncated)"
 
 
 async def _emit_events(messages) -> None:

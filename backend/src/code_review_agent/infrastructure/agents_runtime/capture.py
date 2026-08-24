@@ -33,16 +33,13 @@ from langchain_core.messages import AIMessage
 from deepagents._models import get_model_identifier, model_matches_spec
 
 from infrastructure.agents_runtime.report_parse import report_dict_from_text
+from infrastructure.agents_runtime.utils import truncate as _truncate
 from infrastructure.config import settings
 from infrastructure.event_bus.log_event_bus import _append_to_file, log_event
 
 logger = logging.getLogger(__name__)
 
 _CAPTURE_CONTENT_MAX_CHARS = 4000
-
-
-def _truncate(text: str, limit: int = _CAPTURE_CONTENT_MAX_CHARS) -> str:
-    return text if len(text) <= limit else text[:limit] + "...(truncated)"
 
 
 def _model_label(model: object) -> str:

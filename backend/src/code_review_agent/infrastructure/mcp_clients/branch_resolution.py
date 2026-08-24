@@ -14,6 +14,7 @@ Response shape verified against the live server (Branch-Aware addendum §4):
 import json
 from typing import Any
 
+from infrastructure.agents_runtime.utils import extract_text as _extract_text
 from infrastructure.mcp_clients.mcp_client_factory import scoped
 
 
@@ -61,27 +62,3 @@ async def resolve_branch_to_commit(
                 return sha
             raise BranchNotFoundError(owner, repo, branch)
     raise BranchNotFoundError(owner, repo, branch)
-
-
-def _extract_text(result: Any) -> str:
-    """Pull the text payload out of a langchain tool result.
-
-    The GitHub MCP tool returns ``list[dict]`` content items with a ``text``
-    key (and possibly ``structuredContent``); ``str`` or plain objects are
-    returned as-is.
-    """
-    if isinstance(result, str):
-        return result
-    content = getattr(result, "content", result)
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-            elif isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                parts.append(item["text"])
-        return "\n".join(parts)
-    if isinstance(content, dict):
-        text = content.get("text")
-        return text if isinstance(text, str) else json.dumps(content)
-    return str(content or "")

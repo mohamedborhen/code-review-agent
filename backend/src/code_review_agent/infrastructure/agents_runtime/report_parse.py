@@ -17,6 +17,8 @@ uses to stash the last report per agent, so the parser can fall back to it.
 import json
 import re
 
+from infrastructure.agents_runtime.utils import findings_list as _findings_list
+
 __all__ = ["extract_json_text", "report_dict_from_text"]
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -41,29 +43,6 @@ def extract_json_text(text: str) -> str:
         return match.group(1).strip()
     match = _XML_RE.search(text)
     return match.group(1).strip() if match else text
-
-
-def _findings_list(raw: dict) -> list | None:
-    """Locate the findings array under any of the shapes subagents emit.
-
-    Subagents nest reports under domain keys (``security_review``,
-    ``compliance_report``, ...) and vary the array name (``findings``,
-    ``violations``, ``security_findings``, ...). Recurse one level into nested
-    dicts so a report like ``{"security_review": {"findings": [...]}}`` parses.
-    """
-    for key in ("findings", "violations"):
-        value = raw.get(key)
-        if isinstance(value, list):
-            return value
-    for key, value in raw.items():
-        if key.endswith("findings") and isinstance(value, list):
-            return value
-    for value in raw.values():
-        if isinstance(value, dict):
-            nested = _findings_list(value)
-            if nested is not None:
-                return nested
-    return None
 
 
 def report_dict_from_text(text: str) -> dict | None:

@@ -17,6 +17,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict
 
 from infrastructure.agents_runtime.tool_scoping import _strip_null_unions, scope_agent_tools
+from infrastructure.agents_runtime.utils import extract_text as _extract_text
 from infrastructure.mcp_clients.mcp_client_factory import scoped
 
 logger = logging.getLogger(__name__)
@@ -173,23 +174,3 @@ async def search_conversation_context(
         kwargs["exclude_message_id"] = exclude_message_id
     result = await tool.ainvoke(kwargs)
     return _extract_text(result)
-
-
-def _extract_text(result) -> str:
-    """Pull the text payload out of a langchain tool result (mirrors
-    branch_resolution._extract_text)."""
-    if isinstance(result, str):
-        return result
-    content = getattr(result, "content", result)
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-            elif isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                parts.append(item["text"])
-        return "\n".join(parts)
-    if isinstance(content, dict):
-        text = content.get("text")
-        return text if isinstance(text, str) else str(content)
-    return str(content or "")
