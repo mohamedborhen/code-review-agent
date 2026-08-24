@@ -30,7 +30,15 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
-from deepagents._models import get_model_identifier, model_matches_spec
+try:
+    from deepagents._models import get_model_identifier, model_matches_spec
+except ImportError:
+    # Graceful fallback if deepagents internal API changes
+    def get_model_identifier(model: object) -> str | None:
+        return getattr(model, "model_id", None)
+
+    def model_matches_spec(model: object, spec: str) -> bool:
+        return False
 
 from infrastructure.agents_runtime.report_parse import report_dict_from_text
 from infrastructure.agents_runtime.utils import truncate as _truncate
