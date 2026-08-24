@@ -31,11 +31,9 @@ import dataclasses
 import json
 import logging
 import time
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlmodel import Session, select
 
 from application.graph_build_service.graph_readiness_service import GraphReadinessService
 from application.repo_ingestion_service.ensure_branch_worktree import (
@@ -48,17 +46,15 @@ from application.review_service.errors import (
 )
 from application.review_service.prepare_review_context import PrepareReviewContextService
 from application.review_service.run_review import run_review
-from domain.entities.agent_finding import AgentInput, AgentOutput, ReviewResult
+from domain.entities.agent_finding import AgentInput
 from domain.review.routing_policy import agents_for_request
-from infrastructure.agents_runtime.capture import CaptureStore
 from infrastructure.agents_runtime.middleware import render_timeline
 from infrastructure.agents_runtime.orchestrator_runtime import OrchestratorRuntime
 from infrastructure.api.models import ReviewRequest
 from infrastructure.config import settings
-from infrastructure.db.engine import engine
 from infrastructure.db.graph_status_repository import SQLModelGraphStatusQuery
-from infrastructure.db.models import AgentExecution, ReviewSession, ReviewToolCall
 from infrastructure.db.repo_workspace_repository import SQLModelRepoWorkspaceRepository
+from infrastructure.db.review_session_repository import ReviewSessionRepository
 from infrastructure.db.review_tool_call_repository import ReviewToolCallRepository
 from infrastructure.event_bus.log_event_bus import log_event
 from infrastructure.graph_builder.crg_mcp_adapter import CRGMcpAdapter
@@ -92,6 +88,11 @@ _ensure_worktree = EnsureBranchWorktreeService(
 )
 
 _tool_call_repo = ReviewToolCallRepository()
+
+# Stateless DB adapter for ReviewSession/AgentExecution persistence — each call
+# opens its own Session, so a module-level instance is safe. All methods are
+# sync; routes invoke them via asyncio.to_thread.
+_review_repo = ReviewSessionRepository()
 
 
 @router.post("/review")
@@ -145,7 +146,16 @@ async def review(
             _touch_recency, _repo_store, body.repo_id, body.branch
         )
 
-    session_id = await asyncio.to_thread(_create_review_session, body, resolved_commit)
+    session_id = await asyncio.to_thread(
+        _review_repo.create,
+        repo_id=body.repo_id,
+        graph_commit_hash=resolved_commit,
+        request_type=body.request_type,
+        model=settings.review_model,
+        expected_agents=agents_for_request(body.request_type) or [],
+        conversation_id=body.conversation_id,
+        user_id=body.user_id,
+    )
 
     review_input = AgentInput(
         repo_id=body.repo_id,
@@ -186,7 +196,7 @@ async def review(
     except UnknownRequestTypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        await asyncio.to_thread(_record_error_execution, session_id, exc)
+        await asyncio.to_thread(_review_repo.mark_failed, session_id, exc)
         logger.error("Review failed for session %s: %s", session_id, exc)
         raise HTTPException(status_code=500, detail="Review failed") from exc
     finally:
@@ -200,7 +210,15 @@ async def review(
     if review_input.conversation_id is not None:
         background_tasks.add_task(orchestrator.write_durable_conversation_summary, review_input)
 
-    await asyncio.to_thread(_record_executions, session_id, outcome, duration_ms, orchestrator.capture)
+    await asyncio.to_thread(
+        _review_repo.record_executions,
+        session_id,
+        outcome.per_agent,
+        outcome.aggregated,
+        duration_ms=duration_ms,
+        capture=orchestrator.capture,
+        model=settings.review_model,
+    )
 
     timeline = orchestrator.capture.consume_timeline()
     await log_event("timeline", content=render_timeline(timeline))
@@ -246,86 +264,6 @@ def _touch_recency(repo_store, repo_id: str, branch: str) -> None:
         logger.warning("recency touch failed for %s@%s: %s", repo_id, branch, exc)
 
 
-def _create_review_session(body: ReviewRequest, resolved_commit: str) -> int:
-    with Session(engine) as session:
-        row = ReviewSession(
-            repo_id=body.repo_id,
-            graph_commit_hash=resolved_commit,
-            request_type=body.request_type,
-            model=settings.review_model,
-            status="running",
-            expected_agents=json.dumps(agents_for_request(body.request_type) or []),
-            conversation_id=body.conversation_id,
-            user_id=body.user_id,
-        )
-        session.add(row)
-        session.commit()
-        session.refresh(row)
-        return row.id
-
-
-def _record_executions(
-    session_id: int,
-    outcome: ReviewResult,
-    duration_ms: int,
-    capture: CaptureStore,
-) -> None:
-    with Session(engine) as session:
-        review_session = session.get(ReviewSession, session_id)
-        if review_session is not None:
-            review_session.status = "completed"
-            review_session.duration_ms = duration_ms
-            review_session.completed_at = datetime.now(timezone.utc)
-            review_session.dispatched_agents = json.dumps(
-                [per_agent.agent_name for per_agent in outcome.per_agent]
-            )
-        for per_agent in outcome.per_agent:
-            session.add(
-                AgentExecution(
-                    review_session_id=session_id,
-                    agent_name=per_agent.agent_name,
-                    duration_ms=capture.consume_duration(per_agent.agent_name),
-                    confidence=_max_confidence(per_agent),
-                    model=capture.consume_model(per_agent.agent_name) or settings.review_model,
-                    result=json.dumps(dataclasses.asdict(per_agent)),
-                )
-            )
-        session.add(
-            AgentExecution(
-                review_session_id=session_id,
-                agent_name=outcome.aggregated.agent_name,
-                duration_ms=duration_ms,
-                confidence=_max_confidence(outcome.aggregated),
-                model=capture.consume_model("orchestrator") or settings.review_model,
-                result=json.dumps(dataclasses.asdict(outcome.aggregated)),
-            )
-        )
-        session.commit()
-
-
-def _record_error_execution(session_id: int, exc: Exception) -> None:
-    with Session(engine) as session:
-        review_session = session.get(ReviewSession, session_id)
-        if review_session is not None:
-            review_session.status = "failed"
-            review_session.error = str(exc)
-        session.add(
-            AgentExecution(
-                review_session_id=session_id,
-                agent_name="orchestrator",
-                duration_ms=0,
-                result=json.dumps({"status": "error", "error": str(exc)}),
-            )
-        )
-        session.commit()
-
-
-def _max_confidence(agent_output: AgentOutput) -> float | None:
-    if not agent_output.findings:
-        return None
-    return max(f.confidence for f in agent_output.findings)
-
-
 # ---------------------------------------------------------------------------
 # GET /reviews/running and GET /reviews/{session_id} — review status endpoints
 # ---------------------------------------------------------------------------
@@ -339,7 +277,7 @@ async def find_running_review(conversation_id: int, user_id: str) -> dict:
     Requires conversation_id + user_id. user_id must match the session's user_id.
     conversation_id is required (each conversation has exactly one active review).
     """
-    row = await asyncio.to_thread(_find_running_review, conversation_id, user_id)
+    row = await asyncio.to_thread(_review_repo.find_running, conversation_id, user_id)
     if row is None:
         return {"review_session_id": None, "status": None}
     return {
@@ -356,15 +294,15 @@ async def get_review(session_id: int, user_id: str) -> dict:
     UNAUTHENTICATED / DEV-ONLY — self-asserted user_id matching, not true auth.
     Requires user_id query param. user_id must match the session's user_id.
     """
-    row = await asyncio.to_thread(_get_review_session, session_id, user_id)
+    row = await asyncio.to_thread(_review_repo.get, session_id, user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Review not found")
     result = None
     if row.status == "completed":
-        raw = await asyncio.to_thread(_get_aggregated_result, session_id)
+        raw = await asyncio.to_thread(_review_repo.get_aggregated_result, session_id)
         if raw is not None:
             result = json.loads(raw)
-    tool_calls = await asyncio.to_thread(_get_tool_calls, session_id)
+    tool_calls = await asyncio.to_thread(_review_repo.get_tool_calls, session_id)
     return {
         "review_session_id": row.id,
         "status": row.status,
@@ -378,52 +316,3 @@ async def get_review(session_id: int, user_id: str) -> dict:
         "tool_calls": tool_calls,
     }
 
-
-def _get_review_session(session_id: int, user_id: str) -> ReviewSession | None:
-    """Load session ONLY if user_id matches. Returns None on mismatch."""
-    with Session(engine) as s:
-        row = s.get(ReviewSession, session_id)
-        if row is None or row.user_id != user_id:
-            return None
-        return row
-
-
-def _get_aggregated_result(session_id: int) -> str | None:
-    with Session(engine) as s:
-        row = s.exec(
-            select(AgentExecution).where(
-                AgentExecution.review_session_id == session_id,
-                AgentExecution.agent_name == "aggregator",
-            )
-        ).first()
-        return row.result if row else None
-
-
-def _get_tool_calls(session_id: int) -> list[dict]:
-    """Return tool-call metadata for a review session."""
-    with Session(engine) as s:
-        rows = s.exec(
-            select(ReviewToolCall).where(ReviewToolCall.review_session_id == session_id)
-        ).all()
-        return [
-            {
-                "agent_name": r.agent_name,
-                "tool_name": r.tool_name,
-                "tool_latency_ms": r.tool_latency_ms,
-                "tool_status": r.tool_status,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in rows
-        ]
-
-
-def _find_running_review(conversation_id: int, user_id: str) -> ReviewSession | None:
-    """Find running review for conversation, enforcing user_id match."""
-    with Session(engine) as s:
-        return s.exec(
-            select(ReviewSession).where(
-                ReviewSession.conversation_id == conversation_id,
-                ReviewSession.user_id == user_id,
-                ReviewSession.status == "running",
-            ).order_by(ReviewSession.created_at.desc()).limit(1)
-        ).first()
