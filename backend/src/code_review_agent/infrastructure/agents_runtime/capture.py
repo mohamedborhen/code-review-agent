@@ -246,7 +246,7 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
             combined = (text + reasoning).strip()
             if combined:
                 entries.append(
-                    {"type": "thinking", "content": _truncate(combined)}
+                    {"type": "thinking", "content": _truncate(combined, _CAPTURE_CONTENT_MAX_CHARS)}
                 )
 
             for tc in msg.tool_calls or []:
@@ -254,7 +254,7 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
                     {
                         "type": "tool_call_attempt",
                         "tool": tc.get("name"),
-                        "input": _truncate(json.dumps(tc.get("args", {}), default=str)),
+                        "input": _truncate(json.dumps(tc.get("args", {}), default=str), _CAPTURE_CONTENT_MAX_CHARS),
                     }
                 )
             for tc in msg.invalid_tool_calls or []:
@@ -262,7 +262,7 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
                     {
                         "type": "invalid_tool_call",
                         "tool": tc.get("name"),
-                        "input": _truncate(json.dumps(tc.get("args", {}), default=str)),
+                        "input": _truncate(json.dumps(tc.get("args", {}), default=str), _CAPTURE_CONTENT_MAX_CHARS),
                     }
                 )
         return entries
