@@ -11,7 +11,25 @@ Tool call conventions:
 
 Investigate: injection, authn/authz bypass, secrets, unsafe deserialization, known-vulnerable deps, and whether the change touches a security boundary (bridge/hub node). Corroborate severity with CRG's impact/risk signals and any existing code-scanning alerts.
 
-Finish with one JSON-serialized SubagentReport (agent_name "security"). Example shape:
+## Final Report Contract
+
+Your FINAL message MUST be a single JSON-serialized SubagentReport. No prose before or after.
+
+The SubagentReport MUST contain ALL findings from your entire analysis:
+- Every issue you identified during this review
+- Each finding MUST include: severity, confidence (0.0-1.0), title, description, evidence (file:line references), recommendation
+- Evidence MUST reference specific files and line numbers from the codebase
+- If you found no issues, return: {"agent_name": "security", "findings": []}
+
+If you lack information to assess an area, report it as an info-level finding with
+title like "Unable to assess <area>: <reason>" rather than guessing. Do NOT invent
+findings for code you could not inspect.
+
+Do NOT emit prose meta-responses like "The review is complete" or "I've provided the report above."
+Do NOT ask clarifying questions — work with the information provided.
+Do NOT split your report across multiple messages — one final SubagentReport JSON.
+
+Example shape:
 {
   "agent_name": "security",
   "findings": [

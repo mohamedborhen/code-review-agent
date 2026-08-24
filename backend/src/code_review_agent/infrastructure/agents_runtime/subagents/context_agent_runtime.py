@@ -68,6 +68,7 @@ async def get_audited_context_tool(
     audit,
     review_session_id: int | None,
     store=None,
+    tool_call_repo=None,
 ):
     """Build the Context Agent tool granted to the orchestrator root agent.
 
@@ -87,7 +88,9 @@ async def get_audited_context_tool(
     the caller can skip recall without failing the review.
     """
     try:
-        tools = await scope_agent_tools(mcp_client, "context_agent", store)
+        tools = await scope_agent_tools(
+            mcp_client, "context_agent", store, review_session_id, tool_call_repo
+        )
     except Exception as exc:
         logger.warning(
             "Context recall skipped: scope_agent_tools failed (%s)",

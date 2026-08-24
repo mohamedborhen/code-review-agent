@@ -51,6 +51,9 @@ class ReviewSession(SQLModel, table=True):
     # auditing from the DB without relying on the ephemeral event log.
     expected_agents: str | None = None
     dispatched_agents: str | None = None
+    # --- review status endpoints (Issue 1) ---
+    conversation_id: int | None = None  # FK to Conversation.id (for /reviews/running lookup)
+    user_id: str | None = None  # caller identity (for self-asserted user_id matching)
 
 
 class AgentExecution(SQLModel, table=True):
@@ -130,3 +133,24 @@ class MemorySummary(SQLModel, table=True):
     summary_text: str
     summarized_up_to_message_id: int = Field(foreign_key="Message.id")
     created_at: datetime = Field(default_factory=_utcnow, sa_column_kwargs={"server_default": _SERVER_NOW})
+
+
+class ReviewToolCall(SQLModel, table=True):
+    """Metadata-only audit of tool calls made during a review session.
+
+    Persisted best-effort inside _wrap_with_events. No tool_input or
+    tool_output — only timing, agent identity, tool name, and status.
+    """
+
+    __tablename__ = "ReviewToolCall"
+    __table_args__ = (
+        CheckConstraint("tool_status IN ('success','error')", name="ck_review_tool_call_status"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    review_session_id: int = Field(foreign_key="reviewsession.id", ondelete="CASCADE", index=True)
+    agent_name: str
+    tool_name: str
+    tool_latency_ms: int | None = None
+    tool_status: str | None = None  # 'success' | 'error'
+    created_at: datetime = Field(default_factory=_utcnow)

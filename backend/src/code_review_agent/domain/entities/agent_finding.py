@@ -27,7 +27,7 @@ class AgentFinding:
 class AgentOutput:
     agent_name: str
     findings: list[AgentFinding] = field(default_factory=list)
-    parse_status: str = "ok"  # "ok" | "parse_failed" | "empty_output"
+    parse_status: str = "ok"  # "ok" | "parse_failed" | "empty_output" | "fallback_from_specialists"
 
 
 @dataclass

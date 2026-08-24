@@ -55,6 +55,9 @@ def _add_model_columns() -> None:
             ("reviewsession", "completed_at", "DATETIME"),
             ("reviewsession", "expected_agents", "TEXT"),
             ("reviewsession", "dispatched_agents", "TEXT"),
+            # review status endpoints (Issue 1)
+            ("reviewsession", "conversation_id", "INTEGER"),
+            ("reviewsession", "user_id", "TEXT"),
         ]
         for table, column, sql_type in column_defs:
             cols = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}

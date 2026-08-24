@@ -16,6 +16,14 @@ Flow (order is load-bearing, see PHASE_2.md DoD):
 Phase 2 is async throughout: DB writes are wrapped in asyncio.to_thread so the
 event loop is never blocked. PrepareReviewContextService is the documented
 blessed sync exception (see AGENTS.md).
+
+SECURITY: GET /reviews/running and GET /reviews/{session_id} enforce
+user_id matching against the session's stored user_id. This is
+self-asserted identity — not true authentication. Any caller can
+claim any user_id. Consistent with the existing zero-auth model
+project-wide. Do not expose to untrusted networks without adding
+HTTPBearer/JWT auth middleware. Any future real auth work should
+cover the whole API, not just these two routes.
 """
 
 import asyncio
@@ -27,7 +35,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from application.graph_build_service.graph_readiness_service import GraphReadinessService
 from application.repo_ingestion_service.ensure_branch_worktree import (
@@ -49,8 +57,9 @@ from infrastructure.api.models import ReviewRequest
 from infrastructure.config import settings
 from infrastructure.db.engine import engine
 from infrastructure.db.graph_status_repository import SQLModelGraphStatusQuery
-from infrastructure.db.models import AgentExecution, ReviewSession
+from infrastructure.db.models import AgentExecution, ReviewSession, ReviewToolCall
 from infrastructure.db.repo_workspace_repository import SQLModelRepoWorkspaceRepository
+from infrastructure.db.review_tool_call_repository import ReviewToolCallRepository
 from infrastructure.event_bus.log_event_bus import log_event
 from infrastructure.graph_builder.crg_mcp_adapter import CRGMcpAdapter
 from infrastructure.mcp_clients.branch_resolution import (
@@ -81,6 +90,8 @@ _ensure_worktree = EnsureBranchWorktreeService(
     settings.workspace_root,
     acquire_workspace_lock,
 )
+
+_tool_call_repo = ReviewToolCallRepository()
 
 
 @router.post("/review")
@@ -164,6 +175,7 @@ async def review(
         request.app.state.mcp_client,
         review_session_id=session_id,
         memory_store=request.app.state.memory_store,
+        tool_call_repo=_tool_call_repo,
     )
 
     start = time.monotonic()
@@ -243,6 +255,8 @@ def _create_review_session(body: ReviewRequest, resolved_commit: str) -> int:
             model=settings.review_model,
             status="running",
             expected_agents=json.dumps(agents_for_request(body.request_type) or []),
+            conversation_id=body.conversation_id,
+            user_id=body.user_id,
         )
         session.add(row)
         session.commit()
@@ -310,3 +324,106 @@ def _max_confidence(agent_output: AgentOutput) -> float | None:
     if not agent_output.findings:
         return None
     return max(f.confidence for f in agent_output.findings)
+
+
+# ---------------------------------------------------------------------------
+# GET /reviews/running and GET /reviews/{session_id} — review status endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/reviews/running")
+async def find_running_review(conversation_id: int, user_id: str) -> dict:
+    """Find the currently running review for a conversation.
+
+    UNAUTHENTICATED / DEV-ONLY — self-asserted user_id matching, not true auth.
+    Requires conversation_id + user_id. user_id must match the session's user_id.
+    conversation_id is required (each conversation has exactly one active review).
+    """
+    row = await asyncio.to_thread(_find_running_review, conversation_id, user_id)
+    if row is None:
+        return {"review_session_id": None, "status": None}
+    return {
+        "review_session_id": row.id,
+        "status": row.status,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.get("/reviews/{session_id}")
+async def get_review(session_id: int, user_id: str) -> dict:
+    """Get review status, result, and tool-call metadata.
+
+    UNAUTHENTICATED / DEV-ONLY — self-asserted user_id matching, not true auth.
+    Requires user_id query param. user_id must match the session's user_id.
+    """
+    row = await asyncio.to_thread(_get_review_session, session_id, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+    result = None
+    if row.status == "completed":
+        raw = await asyncio.to_thread(_get_aggregated_result, session_id)
+        if raw is not None:
+            result = json.loads(raw)
+    tool_calls = await asyncio.to_thread(_get_tool_calls, session_id)
+    return {
+        "review_session_id": row.id,
+        "status": row.status,
+        "repo_id": row.repo_id,
+        "request_type": row.request_type,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "duration_ms": row.duration_ms,
+        "error": row.error,
+        "result": result,
+        "tool_calls": tool_calls,
+    }
+
+
+def _get_review_session(session_id: int, user_id: str) -> ReviewSession | None:
+    """Load session ONLY if user_id matches. Returns None on mismatch."""
+    with Session(engine) as s:
+        row = s.get(ReviewSession, session_id)
+        if row is None or row.user_id != user_id:
+            return None
+        return row
+
+
+def _get_aggregated_result(session_id: int) -> str | None:
+    with Session(engine) as s:
+        row = s.exec(
+            select(AgentExecution).where(
+                AgentExecution.review_session_id == session_id,
+                AgentExecution.agent_name == "aggregator",
+            )
+        ).first()
+        return row.result if row else None
+
+
+def _get_tool_calls(session_id: int) -> list[dict]:
+    """Return tool-call metadata for a review session."""
+    with Session(engine) as s:
+        rows = s.exec(
+            select(ReviewToolCall).where(ReviewToolCall.review_session_id == session_id)
+        ).all()
+        return [
+            {
+                "agent_name": r.agent_name,
+                "tool_name": r.tool_name,
+                "tool_latency_ms": r.tool_latency_ms,
+                "tool_status": r.tool_status,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+
+
+def _find_running_review(conversation_id: int, user_id: str) -> ReviewSession | None:
+    """Find running review for conversation, enforcing user_id match."""
+    with Session(engine) as s:
+        return s.exec(
+            select(ReviewSession).where(
+                ReviewSession.conversation_id == conversation_id,
+                ReviewSession.user_id == user_id,
+                ReviewSession.status == "running",
+            ).order_by(ReviewSession.created_at.desc()).limit(1)
+        ).first()

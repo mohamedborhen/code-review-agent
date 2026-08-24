@@ -1,7 +1,9 @@
 """Shared tool-scoping + prompt loading for the agents_runtime package."""
 
+import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,7 @@ from pydantic import BaseModel
 from infrastructure.agents_runtime.capture import CaptureStore
 from infrastructure.agents_runtime.tool_descriptions import TOOL_DESCRIPTION_OVERRIDES
 from infrastructure.agents_runtime.tool_lists import AGENT_TOOL_PLAN
+from infrastructure.db.models import ReviewToolCall
 from infrastructure.event_bus.log_event_bus import log_event
 from infrastructure.mcp_clients.mcp_client_factory import scoped
 
@@ -98,7 +101,13 @@ def _with_clean_schema(schema: Any) -> Any:
     return schema
 
 
-def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | None = None) -> BaseTool:
+def _wrap_with_events(
+    tool: BaseTool,
+    agent_name: str,
+    store: CaptureStore | None = None,
+    review_session_id: int | None = None,
+    tool_call_repo: Any | None = None,
+) -> BaseTool:
     """Wrap a scoped MCP tool so its call/result reach the event bus.
 
     Subagent-internal MCP calls are invisible to the orchestrator's message walk
@@ -108,6 +117,9 @@ def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | Non
     exact name/schema so the model sees no difference. Each executed call is
     also timed into the shared ``CaptureStore`` so the latency timeline includes
     per-tool durations.
+
+    When review_session_id and tool_call_repo are provided, a best-effort
+    ReviewToolCall row is persisted on both success and error paths.
     """
     if not isinstance(tool, StructuredTool):
         return tool
@@ -136,6 +148,21 @@ def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | Non
                 ts=ts,
                 duration_ms=duration_ms,
             )
+            if review_session_id is not None and tool_call_repo is not None:
+                try:
+                    await asyncio.to_thread(
+                        tool_call_repo.add,
+                        ReviewToolCall(
+                            review_session_id=review_session_id,
+                            agent_name=agent_name,
+                            tool_name=tool.name,
+                            tool_latency_ms=duration_ms,
+                            tool_status="error",
+                            created_at=datetime.now(timezone.utc),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("ReviewToolCall insert failed (best-effort)", exc_info=True)
             raise
         duration_ms = int((time.monotonic() - start) * 1000)
         if store is not None:
@@ -148,6 +175,21 @@ def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | Non
             ts=ts,
             duration_ms=duration_ms,
         )
+        if review_session_id is not None and tool_call_repo is not None:
+            try:
+                await asyncio.to_thread(
+                    tool_call_repo.add,
+                    ReviewToolCall(
+                        review_session_id=review_session_id,
+                        agent_name=agent_name,
+                        tool_name=tool.name,
+                        tool_latency_ms=duration_ms,
+                        tool_status="success",
+                        created_at=datetime.now(timezone.utc),
+                    ),
+                )
+            except Exception:
+                logger.debug("ReviewToolCall insert failed (best-effort)", exc_info=True)
         return result
 
     return StructuredTool.from_function(
@@ -160,7 +202,13 @@ def _wrap_with_events(tool: BaseTool, agent_name: str, store: CaptureStore | Non
     )
 
 
-async def scope_agent_tools(mcp_client, agent_name: str, store: CaptureStore | None = None) -> list[BaseTool]:
+async def scope_agent_tools(
+    mcp_client,
+    agent_name: str,
+    store: CaptureStore | None = None,
+    review_session_id: int | None = None,
+    tool_call_repo: Any | None = None,
+) -> list[BaseTool]:
     """Fetch tools from the shared client and scope them to the agent's plan.
 
     D-12 resilience: if an MCP server is unreachable (e.g. atlassian crash),
@@ -183,7 +231,13 @@ async def scope_agent_tools(mcp_client, agent_name: str, store: CaptureStore | N
             )
             continue
         if allowed is None:
-            tools.extend(_wrap_with_events(t, agent_name, store) for t in server_tools)
+            tools.extend(
+                _wrap_with_events(t, agent_name, store, review_session_id, tool_call_repo)
+                for t in server_tools
+            )
             continue
-        tools.extend(_wrap_with_events(t, agent_name, store) for t in scoped(server_tools, allowed))
+        tools.extend(
+            _wrap_with_events(t, agent_name, store, review_session_id, tool_call_repo)
+            for t in scoped(server_tools, allowed)
+        )
     return tools

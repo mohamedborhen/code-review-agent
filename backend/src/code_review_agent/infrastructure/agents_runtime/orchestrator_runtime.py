@@ -16,6 +16,7 @@ Design notes:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -107,6 +108,7 @@ class OrchestratorRuntime:
         mcp_client,
         review_session_id: int | None = None,
         memory_store=None,
+        tool_call_repo=None,
     ) -> None:
         self._mcp_client = mcp_client
         self._review_session_id = review_session_id
@@ -114,6 +116,7 @@ class OrchestratorRuntime:
         # Passed to create_deep_agent(store=...) so the LangMem memory tools
         # (constructed without store=) resolve it at runtime (PHASE_4.md §6.1).
         self._memory_store = memory_store
+        self._tool_call_repo = tool_call_repo
         self.capture = CaptureStore()
 
     async def run_review(self, review_input: AgentInput, agent_names: list[str]) -> ReviewResult:
@@ -123,7 +126,9 @@ class OrchestratorRuntime:
         subagent_specs = []
         if agent_names:
             for name in _ALL_SUBAGENTS:
-                spec = await _SUBAGENT_BUILDERS[name](self._mcp_client, self.capture)
+                spec = await _SUBAGENT_BUILDERS[name](
+                    self._mcp_client, self.capture, self._review_session_id, self._tool_call_repo
+                )
                 middleware = list(spec.get("middleware") or [])
                 middleware.append(TransientRetryMiddleware())
                 spec["middleware"] = middleware
@@ -167,7 +172,7 @@ class OrchestratorRuntime:
         # argument additively with the built-in suite, so `task` is preserved;
         # the harness profile still strips the filesystem/execute built-ins.
         root_tools = await _build_root_tools(
-            review_input, self._mcp_client, self._review_session_id, self.capture
+            review_input, self._mcp_client, self._review_session_id, self.capture, self._tool_call_repo
         )
 
         # The conversation-context prompt block must match what the root agent
@@ -246,7 +251,8 @@ class OrchestratorRuntime:
 
 
 async def _build_root_tools(
-    review_input: AgentInput, mcp_client, review_session_id: int | None, store: CaptureStore
+    review_input: AgentInput, mcp_client, review_session_id: int | None, store: CaptureStore,
+    tool_call_repo=None,
 ) -> list:
     """Return the root agent's tool list (never None — the root is never tool-less).
 
@@ -274,6 +280,7 @@ async def _build_root_tools(
         audit=SQLModelConversationAudit(),
         review_session_id=review_session_id,
         store=store,
+        tool_call_repo=tool_call_repo,
     )
     if audited_context_tool is not None:
         tools.append(audited_context_tool)
@@ -486,6 +493,18 @@ def _enforce_evidence_discipline(output: AgentOutput) -> AgentOutput:
     return output
 
 
+# DEDUPLICATION HEURISTIC: identity = sha256(description + "\x00" + first_evidence)[:16]
+#
+# Best-effort, not a semantic guarantee:
+# - description is the most stable field (never mutated by (unverified) prefix or id fallback)
+# - first_evidence anchors to a specific code location
+# - title is EXCLUDED because _enforce_evidence_discipline mutates it with "(unverified)" prefix
+# - severity is EXCLUDED (only 3 values: info/warning/critical)
+# - confidence is EXCLUDED (float, unstable across coercion paths)
+#
+# Edge cases:
+# - Two genuinely distinct findings with identical description+first_evidence -> collapsed (acceptable)
+# - One finding split across two specialists with slightly different descriptions -> not collapsed (acceptable)
 def _parse_aggregated(result: dict) -> AgentOutput:
     structured = result.get("structured_response")
     if isinstance(structured, SubagentReport):
@@ -517,6 +536,43 @@ def _parse_aggregated(result: dict) -> AgentOutput:
         return from_dict
     if from_messages is not None:
         return from_messages
+    # Specialist-fallback: when the aggregator's own output cannot be parsed,
+    # synthesize findings from specialist ToolMessages that parsed successfully.
+    # Only specialists with parse_status="ok" and non-empty findings contribute;
+    # parse_failed specialists are excluded to avoid injecting empty/diagnostic
+    # findings into the aggregated output.  Deduplication uses a content-identity
+    # heuristic (see docstring below).
+    messages = result.get("messages", [])
+    if messages:
+        task_calls = _index_task_calls(messages)
+        specialist_outputs = []
+        for msg in messages:
+            if not isinstance(msg, ToolMessage):
+                continue
+            agent = task_calls.get(msg.tool_call_id)
+            if agent and agent != "orchestrator":
+                output = _parse_tool_message(agent, msg.content)
+                if output.parse_status == "ok" and output.findings:
+                    specialist_outputs.append(output)
+        if specialist_outputs:
+            all_findings = []
+            for output in specialist_outputs:
+                all_findings.extend(output.findings)
+            # Deduplicate by content identity (HEURISTIC — see docstring)
+            seen: dict[str, AgentFinding] = {}
+            for f in all_findings:
+                first_evidence = f.evidence[0] if f.evidence else ""
+                identity = hashlib.sha256(
+                    f"{f.description}\x00{first_evidence}".encode()
+                ).hexdigest()[:16]
+                if identity not in seen or f.confidence > seen[identity].confidence:
+                    seen[identity] = f
+            deduped = list(seen.values())
+            return AgentOutput(
+                agent_name="aggregator",
+                findings=deduped,
+                parse_status="fallback_from_specialists",
+            )
     logger.warning("No structured_response in orchestrator result; returning empty aggregated output")
     return AgentOutput(
         agent_name="aggregator",
@@ -746,6 +802,18 @@ def _findings_list(raw: dict) -> list | None:
 
 def _coerce_report(text: str, agent_name: str) -> SubagentReport:
     raw = json.loads(text)
+    if isinstance(raw, list):
+        inner = raw
+        while isinstance(inner, list) and len(inner) == 1:
+            inner = inner[0]
+        if (
+            isinstance(inner, dict)
+            and inner.get("name") == "SubagentReport"
+            and isinstance(inner.get("parameters"), dict)
+        ):
+            raw = inner["parameters"]
+        else:
+            return SubagentReport(agent_name=agent_name)
     if not isinstance(raw, dict):
         return SubagentReport(agent_name=agent_name)
     findings_raw = _findings_list(raw) or []
