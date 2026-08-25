@@ -15,3 +15,6 @@ session-backup.json
 .vscode/
 .github/
 .opencode/
+.superpowers/
+frontend/dist/
+frontend/node_modules/

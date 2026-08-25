@@ -155,8 +155,8 @@ export default function MainChat() {
         />
       </TopBar>
 
-      {/* Main content area */}
-      <main className="ml-[280px] mt-16 h-[calc(100vh-64px)] flex flex-col relative bg-surface-dim">
+      {/* Main content area — full width on mobile, offset by sidebar on desktop */}
+      <main className="md:ml-[280px] mt-16 h-[calc(100vh-64px)] flex flex-col relative bg-surface-dim">
         {/* ChatThread now handles the event feed inline */}
         <ChatThread
           messages={messages}
@@ -166,7 +166,7 @@ export default function MainChat() {
 
         {/* Preparing state — 425 graph not ready */}
         {preparing && (
-          <div className="px-lg py-4">
+          <div className="px-4 md:px-lg py-4">
             <div className="max-w-4xl mx-auto w-full">
               <div className="bg-surface-container border border-outline-variant rounded-lg p-4 flex items-center gap-4">
                 <span className="material-symbols-outlined text-primary-fixed-dim animate-spin">
@@ -193,7 +193,7 @@ export default function MainChat() {
 
         {/* Error state */}
         {error && (
-          <div className="px-lg py-4">
+          <div className="px-4 md:px-lg py-4">
             <div className="max-w-4xl mx-auto w-full">
               <div className="bg-surface-container border border-error/30 rounded-lg p-4 flex items-center gap-4">
                 <span className="material-symbols-outlined text-error">error</span>

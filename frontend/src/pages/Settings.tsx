@@ -32,7 +32,8 @@ export default function Settings() {
 
       <TopBar />
 
-      <main className="ml-[280px] mt-16 p-lg w-[calc(100%-280px)] h-[calc(100vh-64px)] overflow-y-auto bg-surface-dim">
+      {/* Main content — full width on mobile, offset by sidebar on desktop */}
+      <main className="md:ml-[280px] mt-16 p-4 md:p-lg w-full md:w-[calc(100%-280px)] h-[calc(100vh-64px)] overflow-y-auto bg-surface-dim">
         <div className="max-w-6xl mx-auto">
           {/* Header */}
           <div className="mb-margin">
@@ -50,7 +51,7 @@ export default function Settings() {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search settings..."
-              className="w-64 bg-[#0D1117] border border-outline-variant rounded-md py-1.5 px-3 text-body-sm text-on-surface focus:outline-none focus:border-primary-container focus:ring-1 focus:ring-primary-container transition-all"
+              className="w-full sm:w-64 bg-[#0D1117] border border-outline-variant rounded-md py-1.5 px-3 text-body-sm text-on-surface focus:outline-none focus:border-primary-container focus:ring-1 focus:ring-primary-container transition-all"
             />
           </div>
 

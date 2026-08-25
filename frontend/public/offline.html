@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ReviewMind - Offline</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #101418;
+        color: #e0e2e8;
+        font-family: Inter, system-ui, sans-serif;
+      }
+      .container {
+        text-align: center;
+        padding: 2rem;
+        max-width: 400px;
+      }
+      .icon {
+        font-size: 48px;
+        color: #849495;
+        margin-bottom: 1rem;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin-bottom: 0.5rem;
+      }
+      p {
+        color: #b9caca;
+        margin-bottom: 1.5rem;
+        line-height: 1.5;
+      }
+      button {
+        background-color: #00f5ff;
+        color: #002021;
+        border: none;
+        padding: 0.75rem 1.5rem;
+        border-radius: 0.25rem;
+        font-weight: 700;
+        font-size: 11px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        cursor: pointer;
+      }
+      button:hover {
+        background-color: #63f7ff;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="icon">cloud_off</div>
+      <h1>You are offline</h1>
+      <p>Check your internet connection and try again.</p>
+      <button onclick="window.location.reload()">Retry</button>
+    </div>
+  </body>
+</html>
