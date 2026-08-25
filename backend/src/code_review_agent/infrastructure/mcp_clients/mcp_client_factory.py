@@ -35,7 +35,15 @@ logger = logging.getLogger(__name__)
 _rebuild_lock = asyncio.Lock()
 
 
-def build_mcp_client() -> MultiServerMCPClient:
+def build_mcp_client(github_pat_override: str | None = None) -> MultiServerMCPClient:
+    """Build a MultiServerMCPClient with optional per-review GitHub PAT override.
+
+    When ``github_pat_override`` is provided (from the credential vault),
+    it replaces the global ``settings.github_pat`` for this client instance.
+    This is the per-request ephemeral client path described in
+    PHASE_5_FRONTEND.md §3/§4 (FINAL Compliance item 1).
+    """
+    github_pat = github_pat_override or settings.github_pat
     return MultiServerMCPClient(
         {
             "crg": {
@@ -46,7 +54,7 @@ def build_mcp_client() -> MultiServerMCPClient:
                 "transport": "streamable_http",
                 "url": "https://api.githubcopilot.com/mcp/",
                 "headers": {
-                    "Authorization": f"Bearer {settings.github_pat}",
+                    "Authorization": f"Bearer {github_pat}",
                     "X-MCP-Readonly": "true",
                     "X-MCP-Toolsets": "repos,issues,pull_requests,code_security,dependabot,actions",
                 },
@@ -72,21 +80,24 @@ def build_mcp_client() -> MultiServerMCPClient:
     )
 
 
-async def rebuild_mcp_client() -> MultiServerMCPClient:
+async def rebuild_mcp_client(github_pat_override: str | None = None) -> MultiServerMCPClient:
     """Build a fresh MultiServerMCPClient and verify atlassian connectivity.
 
     Called by the review route (D-12) when the health probe fails.  Uses a
     lock to prevent concurrent rebuilds from multiple concurrent requests.
     On success returns the new client; on failure returns a newly-built
     client anyway (tools will be skipped by scope_agent_tools' degraded path).
+
+    ``github_pat_override``: when set (from the credential vault), used
+    instead of the global ``settings.github_pat`` for this client.
     """
     async with _rebuild_lock:
-        new_client = build_mcp_client()
+        new_client = build_mcp_client(github_pat_override=github_pat_override)
         try:
             await new_client.get_tools(server_name="atlassian")
-            logger.info("MCP client rebuilt — atlassian reachable")
+            logger.info("MCP client rebuilt - atlassian reachable")
         except Exception:
-            logger.warning("MCP client rebuilt — atlassian still unreachable (degraded mode)")
+            logger.warning("MCP client rebuilt - atlassian still unreachable (degraded mode)")
         return new_client
 
 
