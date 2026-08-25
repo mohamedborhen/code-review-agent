@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     # overrides it to http://mcp-atlassian:9000/mcp — never hardcode 127.0.0.1
     # in the client factory for the same reason CRG's URL is a setting.
     atlassian_mcp_url: str = "http://127.0.0.1:9000/mcp"
+    # --- Phase 5: Credential Vault ---
+    # Fernet encryption key for storing github_pat, webhook_secret, and jira_api_token
+    # encrypted at rest in the RepoCredential table. 32-byte base64 URL-safe string;
+    # generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Must be set in the environment — no default, no fallback.
+    credential_encryption_key: str
+
     # mcp-atlassian auth (Cloud API tokens). These are handed to the mcp-atlassian
     # process as its own env vars (see run_atlassian_server.sh / docker-compose),
     # not sent as MultiServerMCPClient headers.
