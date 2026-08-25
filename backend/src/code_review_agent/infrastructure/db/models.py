@@ -154,3 +154,31 @@ class ReviewToolCall(SQLModel, table=True):
     tool_latency_ms: int | None = None
     tool_status: str | None = None  # 'success' | 'error'
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+# --- Phase 5: Credential Vault (PHASE_5_FRONTEND.md §3/§4, FINAL Compliance) ---
+# Stores encrypted per-repo credentials written on POST /api/v1/repos.
+# Fernet-encrypted fields: github_pat, webhook_secret, jira_api_token, repo_url.
+# NEVER logged, NEVER returned in responses, NEVER written to .git/config.
+class RepoCredential(SQLModel, table=True):
+    """Per-repo encrypted credential vault.
+
+    Encrypted fields are Fernet ciphertext blobs. Plaintext is never stored,
+    logged, or returned in any API response. Per the vault exception in
+    AGENTS.md Decision 7: this table, Fernet(CREDENTIAL_ENCRYPTION_KEY),
+    per-repo HMAC, per-request PAT/Jira headers, and Jira URL spike override
+    are the ONLY authorized backend changes for Phase 5.
+    """
+
+    __tablename__ = "RepoCredential"
+
+    id: int | None = Field(default=None, primary_key=True)
+    repo_id: str = Field(index=True, unique=True)
+    owning_user_id: str = Field(index=True)
+    repo_url_encrypted: bytes | None = None
+    github_pat_encrypted: bytes | None = None
+    webhook_secret_encrypted: bytes | None = None
+    jira_url: str | None = None
+    jira_email: str | None = None
+    jira_api_token_encrypted: bytes | None = None
+    created_at: datetime = Field(default_factory=_utcnow)
