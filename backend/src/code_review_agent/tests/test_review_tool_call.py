@@ -1,7 +1,8 @@
-"""Tests for Issue 5: ReviewToolCall persistence — metadata-only, best-effort.
+"""Tests for ReviewToolCall persistence — input/output, metadata, best-effort.
 
-Verifies that _wrap_with_events persists ReviewToolCall rows on both
-success and error paths, and that DB failures are swallowed.
+Verifies that _wrap_with_events persists ReviewToolCall rows with truncated,
+sanitized tool_input and tool_output on both success and error paths, and that
+DB failures are swallowed.
 """
 
 import unittest
@@ -119,3 +120,48 @@ class ReviewToolCallPersistenceTest(unittest.IsolatedAsyncioTestCase):
         wrapped = _wrap_with_events(plain, "compliance", None, review_session_id=42, tool_call_repo=MagicMock())
         # Non-StructuredTool tools are returned as-is
         self.assertIs(wrapped, plain)
+
+    async def test_success_path_includes_tool_input_and_output(self):
+        """Success path persists truncated tool_input and tool_output."""
+        mock_repo = MagicMock()
+        store = CaptureStore()
+        wrapped = _wrap_with_events(DummyTool, "compliance", store, review_session_id=42, tool_call_repo=mock_repo)
+
+        await wrapped.ainvoke({"query": "test"})
+
+        call_arg = mock_repo.add.call_args[0][0]
+        self.assertIsInstance(call_arg, ReviewToolCall)
+        self.assertIsNotNone(call_arg.tool_input)
+        self.assertIn("query", call_arg.tool_input)
+        self.assertIn("test", call_arg.tool_input)
+        self.assertIsNotNone(call_arg.tool_output)
+        self.assertIn("ok", call_arg.tool_output)
+
+    async def test_error_path_includes_tool_input_and_output(self):
+        """Error path persists tool_input and error message in tool_output."""
+        mock_repo = MagicMock()
+        store = CaptureStore()
+        wrapped = _wrap_with_events(FailingTool, "security", store, review_session_id=99, tool_call_repo=mock_repo)
+
+        with self.assertRaises(ValueError):
+            await wrapped.ainvoke({"query": "test"})
+
+        call_arg = mock_repo.add.call_args[0][0]
+        self.assertIsInstance(call_arg, ReviewToolCall)
+        self.assertIsNotNone(call_arg.tool_input)
+        self.assertIn("query", call_arg.tool_input)
+        self.assertIsNotNone(call_arg.tool_output)
+        self.assertIn("ERROR", call_arg.tool_output)
+        self.assertIn("ValueError", call_arg.tool_output)
+
+    async def test_tool_input_sanitized_of_secrets(self):
+        """Tool input with a PAT is redacted before persisting."""
+        mock_repo = MagicMock()
+        store = CaptureStore()
+        wrapped = _wrap_with_events(DummyTool, "compliance", store, review_session_id=42, tool_call_repo=mock_repo)
+
+        await wrapped.ainvoke({"query": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"})
+
+        call_arg = mock_repo.add.call_args[0][0]
+        self.assertNotIn("ghp_", call_arg.tool_input)
+        self.assertIn("[REDACTED]", call_arg.tool_input)

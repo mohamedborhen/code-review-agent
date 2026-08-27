@@ -142,7 +142,8 @@ class OrchestratorRuntime:
         ]
 
         root_tools = await _build_root_tools(
-            review_input, self._mcp_client, self._review_session_id, self.capture, self._tool_call_repo
+            review_input, self._mcp_client, self._review_session_id, self.capture,
+            self._tool_call_repo, agent_names=agent_names,
         )
 
         context_available = any(t.name == "search_messages" for t in root_tools)
@@ -196,13 +197,15 @@ class OrchestratorRuntime:
 
 async def _build_root_tools(
     review_input: AgentInput, mcp_client, review_session_id: int | None, store: CaptureStore,
-    tool_call_repo=None,
+    tool_call_repo=None, agent_names: list[str] | None = None,
 ) -> list:
     """Return the root agent's tool list (never None — the root is never tool-less)."""
     tools = build_shared_memory_tools()
     if review_input.conversation_id is None:
         return tools
     if review_input.user_id is None:
+        return tools
+    if agent_names is not None and not agent_names:
         return tools
     audited_context_tool = await get_audited_context_tool(
         mcp_client,

@@ -4,12 +4,14 @@ import { loadIdentity } from "../../state/identity";
 
 interface JiraStatusCardProps {
   connected?: boolean;
+  repo_id?: string;
   onConnect?: (url: string, email: string, token: string) => void;
   onDisconnect?: () => void;
 }
 
 export default function JiraStatusCard({
   connected = false,
+  repo_id,
   onConnect,
   onDisconnect,
 }: JiraStatusCardProps) {
@@ -31,6 +33,7 @@ export default function JiraStatusCard({
     try {
       const body = {
         user_id: identity.user_id,
+        repo_id: repo_id ?? "*",
         jira_url: jiraUrl,
         jira_email: email,
         jira_api_token: token,

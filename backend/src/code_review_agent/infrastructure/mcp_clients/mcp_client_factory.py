@@ -35,15 +35,27 @@ logger = logging.getLogger(__name__)
 _rebuild_lock = asyncio.Lock()
 
 
-def build_mcp_client(github_pat_override: str | None = None) -> MultiServerMCPClient:
-    """Build a MultiServerMCPClient with optional per-review GitHub PAT override.
+def build_mcp_client(
+    github_pat_override: str | None = None,
+    jira_headers: dict[str, str] | None = None,
+) -> MultiServerMCPClient:
+    """Build a MultiServerMCPClient with optional per-review overrides.
 
     When ``github_pat_override`` is provided (from the credential vault),
     it replaces the global ``settings.github_pat`` for this client instance.
-    This is the per-request ephemeral client path described in
-    PHASE_5_FRONTEND.md §3/§4 (FINAL Compliance item 1).
+
+    When ``jira_headers`` is provided (from the credential vault via
+    build_jira_headers_for_user()), it replaces the global atlassian
+    connection headers. This injects per-user X-Atlassian-Jira-Url and
+    Authorization headers into every MCP request to mcp-atlassian.
     """
     github_pat = github_pat_override or settings.github_pat
+    atlassian_config: dict = {
+        "transport": "streamable_http",
+        "url": settings.atlassian_mcp_url,
+    }
+    if jira_headers:
+        atlassian_config["headers"] = jira_headers
     return MultiServerMCPClient(
         {
             "crg": {
@@ -59,10 +71,7 @@ def build_mcp_client(github_pat_override: str | None = None) -> MultiServerMCPCl
                     "X-MCP-Toolsets": "repos,issues,pull_requests,code_security,dependabot,actions",
                 },
             },
-            "atlassian": {
-                "transport": "streamable_http",
-                "url": settings.atlassian_mcp_url,
-            },
+            "atlassian": atlassian_config,
             "context7": {
                 "transport": "streamable_http",
                 "url": "https://mcp.context7.com/mcp",
@@ -80,7 +89,10 @@ def build_mcp_client(github_pat_override: str | None = None) -> MultiServerMCPCl
     )
 
 
-async def rebuild_mcp_client(github_pat_override: str | None = None) -> MultiServerMCPClient:
+async def rebuild_mcp_client(
+    github_pat_override: str | None = None,
+    jira_headers: dict[str, str] | None = None,
+) -> MultiServerMCPClient:
     """Build a fresh MultiServerMCPClient and verify atlassian connectivity.
 
     Called by the review route (D-12) when the health probe fails.  Uses a
@@ -90,9 +102,14 @@ async def rebuild_mcp_client(github_pat_override: str | None = None) -> MultiSer
 
     ``github_pat_override``: when set (from the credential vault), used
     instead of the global ``settings.github_pat`` for this client.
+    ``jira_headers``: when set (from the credential vault), injected into
+    every MCP request to mcp-atlassian for per-user Jira auth/URL.
     """
     async with _rebuild_lock:
-        new_client = build_mcp_client(github_pat_override=github_pat_override)
+        new_client = build_mcp_client(
+            github_pat_override=github_pat_override,
+            jira_headers=jira_headers,
+        )
         try:
             await new_client.get_tools(server_name="atlassian")
             logger.info("MCP client rebuilt - atlassian reachable")

@@ -6,30 +6,151 @@ import BranchDropdown from "../components/repo/BranchDropdown";
 import ChatThread, { type ChatMessage } from "../components/chat/ChatThread";
 import MessageComposer from "../components/chat/MessageComposer";
 import { useActiveRepo } from "../state/activeRepo";
-import { useConversationCache } from "../state/conversationCache";
+import {
+  useConversationCache,
+  getReviewSessionId,
+  setReviewSessionId,
+  getPendingTurn,
+  setPendingTurn,
+  getToolCallsCache,
+  setToolCallsCache,
+  clearReviewState,
+} from "../state/conversationCache";
+import { useConversationState } from "../state/conversationState";
 import { loadIdentity } from "../state/identity";
 import { createConversation } from "../api/conversations";
+import { getLatestReview } from "../api/reviewStatus";
 import { useReviewTurn } from "../hooks/useReviewTurn";
 import { useReviewProgress } from "../hooks/useReviewProgress";
-import type { RequestType, AggregatedOutput } from "../types/api";
+import type { RequestType, AggregatedOutput, ReviewToolCallItem } from "../types/api";
 
 export default function MainChat() {
   const { repo_id, branch, selectRepo, selectBranch } = useActiveRepo();
-  const { conversations, addConversation } = useConversationCache();
+  const { conversations, addConversation, removeConversation, renameConversation } = useConversationCache();
+  const {
+    activeConversationId,
+    setActiveConversationId,
+    messages,
+    setMessages,
+    switchConversation,
+  } = useConversationState();
   const identity = loadIdentity();
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
 
   const { isWorking, error, preparing, sendTurn, retryPreparing, reset } = useReviewTurn();
   const { toolCalls, startPolling, stopPolling, setToolCalls } = useReviewProgress();
 
-  // Refs to hold the current turn's data for retry
   const pendingTurnRef = useRef<{
     content: string;
     requestType: RequestType;
   } | null>(null);
 
-  // Cleanup polling on unmount
+  // Restore pendingTurn from localStorage on mount / conversation switch
+  useEffect(() => {
+    if (activeConversationId) {
+      pendingTurnRef.current = getPendingTurn(activeConversationId);
+    }
+  }, [activeConversationId]);
+
+  // Cleanup: save tool calls to cache on unmount or conversation switch
+  const prevConversationIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    const prevId = prevConversationIdRef.current;
+    if (prevId !== null && prevId !== activeConversationId) {
+      // Save tool calls for the previous conversation
+      setToolCallsCache(prevId, toolCalls);
+    }
+    prevConversationIdRef.current = activeConversationId;
+
+    return () => {
+      // On unmount: save current tool calls
+      if (activeConversationId) {
+        setToolCallsCache(activeConversationId, toolCalls);
+      }
+    };
+  }, [activeConversationId, toolCalls]);
+
+  // Restore tool calls from cache on conversation switch
+  useEffect(() => {
+    if (activeConversationId) {
+      const cached = getToolCallsCache(activeConversationId);
+      setToolCalls(cached);
+    }
+  }, [activeConversationId, setToolCalls]);
+
+  // --- Reconnection on mount: detect orphaned review ---
+  useEffect(() => {
+    if (!activeConversationId || !identity) return;
+
+    // Only reconnect if the last message is a user message with no assistant response
+    const lastMsg = messages[messages.length - 1];
+    if (!lastMsg || lastMsg.role !== "user") return;
+
+    // Check if there's a stored review_session_id OR if messages suggest an orphaned review
+    const storedSessionId = getReviewSessionId(activeConversationId);
+    // Even without stored session ID, try fetching — the backend may have the review
+
+    // There's an orphaned review — fetch its status
+    let cancelled = false;
+    (async () => {
+      try {
+        const latest = await getLatestReview(activeConversationId, identity.user_id);
+        if (cancelled) return;
+
+        if (latest.review_session_id === null) {
+          // Review disappeared from DB — clear stale state
+          clearReviewState(activeConversationId);
+          return;
+        }
+
+        if (latest.status === "completed" && latest.result) {
+          // Review completed while we were away — restore the result
+          const assistantMsg: ChatMessage = {
+            id: `assistant-reconnect-${Date.now()}`,
+            role: "assistant",
+            content: formatAnswer(latest.result),
+            result: latest.result,
+            timestamp: latest.completed_at ?? new Date().toISOString(),
+          };
+          setMessages((prev) => {
+            // Avoid duplicate if already present
+            const hasAssistant = prev.some((m) => m.role === "assistant" && m.id.startsWith("assistant-reconnect"));
+            if (hasAssistant) return prev;
+            return [...prev, assistantMsg];
+          });
+          // Restore tool calls from the completed review
+          if (latest.tool_calls && latest.tool_calls.length > 0) {
+            setToolCalls(latest.tool_calls);
+          }
+          clearReviewState(activeConversationId);
+        } else if (latest.status === "failed") {
+          // Review failed while we were away — show error
+          setMessages((prev) => {
+            const hasError = prev.some((m) => m.role === "assistant" && m.id.startsWith("assistant-reconnect"));
+            if (hasError) return prev;
+            return [...prev, {
+              id: `assistant-reconnect-${Date.now()}`,
+              role: "assistant",
+              content: `Review failed: ${latest.error ?? "Unknown error"}. Please try again.`,
+              timestamp: new Date().toISOString(),
+            }];
+          });
+          clearReviewState(activeConversationId);
+        } else if (latest.status === "running") {
+          // Review still running — resume polling (preserve cached tool calls)
+          startPolling(activeConversationId, identity.user_id, undefined, true);
+        } else {
+          // Unknown status — clear stale state
+          clearReviewState(activeConversationId);
+        }
+      } catch {
+        // Network error or 404 — clear stale state
+        clearReviewState(activeConversationId);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [activeConversationId, identity, messages, setMessages, setToolCalls, startPolling]);
+
   useEffect(() => {
     return () => {
       stopPolling();
@@ -54,13 +175,30 @@ export default function MainChat() {
     } catch (e) {
       console.error("Failed to create conversation:", e);
     }
-  }, [repo_id, identity, addConversation, reset]);
+  }, [repo_id, identity, addConversation, reset, setActiveConversationId, setMessages, setToolCalls]);
+
+  const handleSelectConversation = useCallback((conversationId: number) => {
+    stopPolling();
+    switchConversation(conversationId);
+    setToolCalls([]);
+    reset();
+  }, [stopPolling, switchConversation, setToolCalls, reset]);
+
+  const handleDeleteConversation = useCallback((conversationId: number) => {
+    removeConversation(conversationId);
+    localStorage.removeItem("reviewmind_messages_v1_" + conversationId);
+    clearReviewState(conversationId);
+    if (activeConversationId === conversationId) {
+      setActiveConversationId(null);
+      setMessages([]);
+      setToolCalls([]);
+    }
+  }, [removeConversation, activeConversationId, setActiveConversationId, setMessages, setToolCalls]);
 
   const handleSend = useCallback(
     async (content: string, requestType: RequestType) => {
       if (!repo_id || !branch || !identity || !activeConversationId) return;
 
-      // Optimistic user bubble
       const userMsg = {
         id: `user-${Date.now()}`,
         role: "user" as const,
@@ -69,14 +207,15 @@ export default function MainChat() {
       };
       setMessages((prev) => [...prev, userMsg]);
 
-      // Store for retry if we get 425
       pendingTurnRef.current = { content, requestType };
+      setPendingTurn(activeConversationId, { content, requestType });
 
-      // Start polling concurrently — runs alongside the review
-      startPolling(activeConversationId, identity.user_id);
+      startPolling(activeConversationId, identity.user_id, (sessionId) => {
+        // Persist review_session_id as soon as polling discovers it
+        setReviewSessionId(activeConversationId, sessionId);
+      });
 
-      // The two-call sequence (Section 2)
-      const result = await sendTurn(
+      const turnResult = await sendTurn(
         activeConversationId,
         identity.user_id,
         repo_id,
@@ -85,25 +224,27 @@ export default function MainChat() {
         branch,
       );
 
-      // Stop polling — sendTurn's response is the final answer
       stopPolling();
 
-      if (result) {
-        // Parse the result — this is the assistant's chat bubble
+      if (turnResult) {
+        // Persist review_session_id for reconnection after navigation
+        setReviewSessionId(activeConversationId, turnResult.response.review_session_id);
+
         const assistantMsg: ChatMessage = {
           id: `assistant-${Date.now()}`,
           role: "assistant",
-          content: formatAnswer(result.result),
-          result: result.result,
+          content: formatAnswer(turnResult.result),
+          result: turnResult.result,
           timestamp: new Date().toISOString(),
         };
         setMessages((prev) => [...prev, assistantMsg]);
         setToolCalls([]);
         pendingTurnRef.current = null;
+        setPendingTurn(activeConversationId, null);
+        clearReviewState(activeConversationId);
       }
-      // If null, either 425 (preparing state) or error — UI already shows it
     },
-    [repo_id, branch, identity, activeConversationId, sendTurn, startPolling, stopPolling],
+    [repo_id, branch, identity, activeConversationId, sendTurn, startPolling, stopPolling, setMessages, setToolCalls],
   );
 
   const handleRetryPreparing = useCallback(async () => {
@@ -111,8 +252,9 @@ export default function MainChat() {
 
     const { content, requestType } = pendingTurnRef.current;
 
-    // Start polling again
-    startPolling(activeConversationId, identity.user_id);
+    startPolling(activeConversationId, identity.user_id, (sessionId) => {
+      setReviewSessionId(activeConversationId, sessionId);
+    });
 
     const result = await retryPreparing(
       activeConversationId,
@@ -136,14 +278,19 @@ export default function MainChat() {
       setMessages((prev) => [...prev, assistantMsg]);
       setToolCalls([]);
       pendingTurnRef.current = null;
+      setPendingTurn(activeConversationId, null);
+      clearReviewState(activeConversationId);
     }
-  }, [repo_id, branch, identity, activeConversationId, retryPreparing, startPolling, stopPolling]);
+  }, [repo_id, branch, identity, activeConversationId, retryPreparing, startPolling, stopPolling, setMessages, setToolCalls]);
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="h-screen bg-background flex flex-col overflow-hidden">
       <Sidebar
         conversations={conversations}
         onNewConversation={handleNewConversation}
+        onSelectConversation={handleSelectConversation}
+        onRenameConversation={renameConversation}
+        onDeleteConversation={handleDeleteConversation}
       />
 
       <TopBar>
@@ -155,18 +302,19 @@ export default function MainChat() {
         />
       </TopBar>
 
-      {/* Main content area — full width on mobile, offset by sidebar on desktop */}
-      <main className="md:ml-[280px] mt-16 h-[calc(100vh-64px)] flex flex-col relative bg-surface-dim">
-        {/* ChatThread now handles the event feed inline */}
+      {/* Main content — flex column, sidebar offset on desktop */}
+      <div className="flex-1 flex flex-col md:ml-[280px] mt-16 min-h-0 bg-surface-dim">
+        {/* Chat area — flex-1, scrollable, no overflow hidden on parent */}
         <ChatThread
           messages={messages}
           toolCalls={toolCalls}
           isWorking={isWorking}
+          conversationId={activeConversationId}
         />
 
         {/* Preparing state — 425 graph not ready */}
         {preparing && (
-          <div className="px-4 md:px-lg py-4">
+          <div className="px-4 md:px-lg py-4 flex-shrink-0">
             <div className="max-w-4xl mx-auto w-full">
               <div className="bg-surface-container border border-outline-variant rounded-lg p-4 flex items-center gap-4">
                 <span className="material-symbols-outlined text-primary-fixed-dim animate-spin">
@@ -193,7 +341,7 @@ export default function MainChat() {
 
         {/* Error state */}
         {error && (
-          <div className="px-4 md:px-lg py-4">
+          <div className="px-4 md:px-lg py-4 flex-shrink-0">
             <div className="max-w-4xl mx-auto w-full">
               <div className="bg-surface-container border border-error/30 rounded-lg p-4 flex items-center gap-4">
                 <span className="material-symbols-outlined text-error">error</span>
@@ -206,21 +354,23 @@ export default function MainChat() {
           </div>
         )}
 
-        <MessageComposer
-          onSend={handleSend}
-          disabled={!repo_id || !branch || !identity || !activeConversationId || isWorking}
-        />
-      </main>
+        {/* Composer — flex child, not absolute */}
+        <div className="flex-shrink-0 border-t border-outline-variant/40 bg-surface/90 backdrop-blur-md">
+          <MessageComposer
+            onSend={handleSend}
+            disabled={!repo_id || !branch || !identity || !activeConversationId || isWorking}
+          />
+        </div>
+      </div>
     </div>
   );
 }
 
-// Format the parsed AggregatedOutput into readable text
 function formatAnswer(result: AggregatedOutput): string {
   const parts: string[] = [];
 
   if (result.parse_status !== "ok") {
-    parts.push(`⚠️ Parse status: ${result.parse_status}`);
+    parts.push(`Parse status: ${result.parse_status}`);
   }
 
   if (result.findings.length === 0) {

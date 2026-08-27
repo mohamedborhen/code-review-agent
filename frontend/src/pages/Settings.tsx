@@ -3,16 +3,19 @@ import Sidebar from "../components/layout/Sidebar";
 import TopBar from "../components/layout/TopBar";
 import ConnectedRepos from "../components/settings/ConnectedRepos";
 import AccountCard from "../components/settings/AccountCard";
+import InstallButton from "../components/settings/InstallButton";
 import JiraStatusCard from "../components/onboarding/JiraStatusCard";
 import { useConversationCache } from "../state/conversationCache";
 import { useNavigate } from "react-router-dom";
+import { getRegisteredRepos } from "../api/repos";
 
 export default function Settings() {
-  const { conversations } = useConversationCache();
+  const { conversations, removeConversation, renameConversation } = useConversationCache();
   const navigate = useNavigate();
   const [refreshKey, setRefreshKey] = useState(0);
   const [jiraConnected, setJiraConnected] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const repo_id = getRegisteredRepos()[0]?.repo_id;
 
   // Frontend-only filter over rendered settings sections
   const sections = [
@@ -28,7 +31,13 @@ export default function Settings() {
 
   return (
     <div className="min-h-screen bg-background flex">
-      <Sidebar conversations={conversations} />
+      <Sidebar
+        conversations={conversations}
+        onNewConversation={() => navigate("/")}
+        onSelectConversation={() => navigate("/")}
+        onRenameConversation={renameConversation}
+        onDeleteConversation={removeConversation}
+      />
 
       <TopBar />
 
@@ -69,7 +78,30 @@ export default function Settings() {
 
             {/* Right Column */}
             <div className="flex flex-col gap-6">
-              {filtered.includes(sections[2]) && <AccountCard />}
+              {filtered.includes(sections[2]) && (
+                <AccountCard onAccountSwitch={(_identity, isNew) => navigate(isNew ? "/onboarding" : "/")} />
+              )}
+
+              {/* PWA Install Button */}
+              <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-6 relative overflow-hidden group hover:border-[#8B949E] transition-colors duration-300">
+                <div className="absolute top-0 left-0 w-1 h-full bg-[#16A34A]" />
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-8 h-8 rounded bg-[#16A34A]/10 flex items-center justify-center">
+                    <span className="material-symbols-outlined text-[#16A34A] text-[20px]">
+                      install_mobile
+                    </span>
+                  </div>
+                  <div>
+                    <h4 className="font-headline-sm text-headline-sm text-on-surface">
+                      Install App
+                    </h4>
+                    <p className="font-body-sm text-body-sm text-on-surface-variant">
+                      Install ReviewMind as a PWA
+                    </p>
+                  </div>
+                </div>
+                <InstallButton />
+              </div>
 
               {filtered.includes(sections[1]) && (
                 <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-6 relative overflow-hidden group hover:border-[#8B949E] transition-colors duration-300">
@@ -109,6 +141,7 @@ export default function Settings() {
                   ) : (
                     <JiraStatusCard
                       connected={false}
+                      repo_id={repo_id}
                       onConnect={() => setJiraConnected(true)}
                     />
                   )}

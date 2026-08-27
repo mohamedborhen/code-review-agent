@@ -30,10 +30,10 @@ export default function MessageComposer({ onSend, disabled }: MessageComposerPro
   }
 
   return (
-    <div className="absolute bottom-0 left-0 right-0 bg-surface/90 backdrop-blur-md border-t border-outline-variant p-2 md:p-4 z-20">
+    <div className="p-2 md:p-4">
       <div className="max-w-4xl mx-auto relative">
         <div className="bg-surface-container border border-outline-variant rounded-lg p-2 focus-within:border-primary-fixed-dim focus-within:shadow-[0_0_8px_rgba(0,220,229,0.2)] transition-all duration-200">
-          {/* Request type selector — ONLY dropdown per §7.3 */}
+          {/* Request type selector */}
           <div className="flex items-center gap-2 px-2 pb-2 border-b border-outline-variant mb-2">
             <div className="relative">
               <button
@@ -84,7 +84,7 @@ export default function MessageComposer({ onSend, disabled }: MessageComposerPro
             disabled={disabled}
           />
 
-          {/* Actions — send button only per §7.3 (attach/snippet CUT) */}
+          {/* Actions */}
           <div className="flex items-center justify-end px-2 pt-2">
             <button
               onClick={handleSend}

@@ -167,6 +167,28 @@ class BuildRootToolsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([t.name for t in tools], ["manage_memory", "search_memory"])
 
+    def test_explain_question_omits_search_messages(self):
+        # explain_question (empty agent_names) must not grant search_messages.
+        client = _FakeMCPClient({"conversation": [_fake_search_tool()]})
+        tools = asyncio.run(
+            _build_root_tools(
+                _agent_input(conversation_id=7, user_id="alice"),
+                client, 42, CaptureStore(), agent_names=[],
+            )
+        )
+        self.assertEqual([t.name for t in tools], ["manage_memory", "search_memory"])
+
+    def test_review_preserves_search_messages(self):
+        # review (non-empty agent_names) must still grant search_messages.
+        client = _FakeMCPClient({"conversation": [_fake_search_tool()]})
+        tools = asyncio.run(
+            _build_root_tools(
+                _agent_input(conversation_id=7, user_id="alice"),
+                client, 42, CaptureStore(), agent_names=["security"],
+            )
+        )
+        self.assertIn("search_messages", [t.name for t in tools])
+
     def test_plan_entry_exactly_search_messages(self):
         self.assertEqual(
             AGENT_TOOL_PLAN["context_agent"], {"conversation": {"search_messages"}}

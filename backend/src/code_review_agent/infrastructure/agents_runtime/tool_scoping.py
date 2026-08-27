@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from infrastructure.agents_runtime.capture import CaptureStore
 from infrastructure.agents_runtime.utils import truncate as _truncate
+from infrastructure.agents_runtime.utils import sanitize_for_storage
 from infrastructure.agents_runtime.tool_descriptions import TOOL_DESCRIPTION_OVERRIDES
 from infrastructure.agents_runtime.tool_lists import AGENT_TOOL_PLAN
 from infrastructure.db.models import ReviewToolCall
@@ -153,6 +154,8 @@ def _wrap_with_events(
                             review_session_id=review_session_id,
                             agent_name=agent_name,
                             tool_name=tool.name,
+                            tool_input=sanitize_for_storage(str(kwargs)),
+                            tool_output=sanitize_for_storage(f"ERROR {type(exc).__name__}: {exc}"),
                             tool_latency_ms=duration_ms,
                             tool_status="error",
                             created_at=datetime.now(timezone.utc),
@@ -160,6 +163,8 @@ def _wrap_with_events(
                     )
                 except Exception:
                     logger.debug("ReviewToolCall insert failed (best-effort)", exc_info=True)
+            if tool.handle_tool_error:
+                return f"ERROR {type(exc).__name__}: {exc}"
             raise
         duration_ms = int((time.monotonic() - start) * 1000)
         if store is not None:
@@ -180,6 +185,8 @@ def _wrap_with_events(
                         review_session_id=review_session_id,
                         agent_name=agent_name,
                         tool_name=tool.name,
+                        tool_input=sanitize_for_storage(str(kwargs)),
+                        tool_output=sanitize_for_storage(str(result)),
                         tool_latency_ms=duration_ms,
                         tool_status="success",
                         created_at=datetime.now(timezone.utc),

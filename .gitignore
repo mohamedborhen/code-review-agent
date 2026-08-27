@@ -18,3 +18,9 @@ session-backup.json
 .superpowers/
 frontend/dist/
 frontend/node_modules/
+# E2E test artifacts (may contain credential snapshots)
+.playwright-mcp/
+test-evidence/
+# Runtime logs
+*.err.log
+*.out.log

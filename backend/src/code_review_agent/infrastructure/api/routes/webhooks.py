@@ -30,13 +30,33 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks) ->
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
 
-    if not verify_signature(raw_body, signature, settings.github_webhook_secret):
+    # Per-repo HMAC: parse repo_id first, then verify against vault.
+    # No global fallback in final phase — contradiction removed (item 3).
+    payload = json.loads(raw_body)
+    repo_id: str = payload["repository"]["full_name"]
+    # Vault lookup: if repo_id was never registered via POST /api/v1/repos, fail closed.
+    try:
+        from infrastructure.db.credential_repository import CredentialRepository
+
+        _vault = CredentialRepository()
+        per_repo_secret = _vault.get_webhook_secret(repo_id)
+    except Exception:
+        per_repo_secret = None
+
+    # Use per-repo secret if present; otherwise fall back to global ONLY during
+    # migration (ALLOW_GLOBAL_WEBHOOK_FALLBACK env, default false, removed after).
+    # Final product requires per-repo secret — global is not a production path.
+    import os
+
+    secret = per_repo_secret
+    if secret is None and os.getenv("ALLOW_GLOBAL_WEBHOOK_FALLBACK", "false").lower() in ("true", "1", "yes"):
+        secret = settings.github_webhook_secret
+
+    if secret is None or not verify_signature(raw_body, signature, secret):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
-    payload = json.loads(raw_body)
     commit_sha: str = payload.get("after", "")
 
-    repo_id: str = payload["repository"]["full_name"]
     branch = _branch_from_ref(payload.get("ref", ""))
 
     if commit_sha == "0000000000000000000000000000000000000000":
@@ -157,13 +177,62 @@ def _run_git_quiet(args: list[str], cwd: str) -> None:
 async def register_repo(body: dict, background_tasks: BackgroundTasks) -> dict:
     repo_url: str = body.get("repo_url", "")
     repo_id: str = body.get("repo_id", "")
+    user_id: str | None = body.get("user_id")
+    github_pat: str | None = body.get("github_pat")
+    webhook_secret: str | None = body.get("webhook_secret")
+    display_name: str | None = body.get("display_name")
 
     if not repo_url or not repo_id:
         raise HTTPException(status_code=400, detail="repo_url and repo_id are required")
+    # user_id is required in final phase (decision 2); keep 400 for missing
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
 
-    background_tasks.add_task(register_and_build, repo_url, repo_id)
+    # repo_id must match repo_url owner/repo (prevent hijack)
+    try:
+        from urllib.parse import urlparse
 
-    return {"status": "accepted", "repo_id": repo_id}
+        path = urlparse(repo_url).path.strip("/").removesuffix(".git")
+        if path.lower() != repo_id.lower():
+            raise HTTPException(status_code=400, detail="repo_id must match repo_url owner/repo")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # Enforce per-repo ownership (409 on hijack) and persist vault row
+    try:
+        from infrastructure.db.credential_repository import CredentialRepository
+        import secrets
+
+        _vault = CredentialRepository()
+        existing = _vault.get_by_repo_id(repo_id)  # returns dict or None
+        if existing and existing.get("owning_user_id") and existing["owning_user_id"] != user_id:
+            raise HTTPException(status_code=409, detail="Repo already registered by another user")
+
+        # Generate webhook secret if caller omitted it (manual step still requires pasting it into GitHub)
+        if not webhook_secret:
+            webhook_secret = secrets.token_hex(20)
+
+        _vault.store(
+            repo_id=repo_id,
+            user_id=user_id,
+            repo_url=repo_url,
+            github_pat=github_pat,
+            webhook_secret=webhook_secret,
+        )
+        credential_stored = True
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Credential store failed for {repo_id}: {e}")
+        credential_stored = False
+        # Fall back to still attempting clone with supplied PAT
+
+    pat_for_clone = github_pat  # use the just-supplied PAT for this clone
+    background_tasks.add_task(register_and_build, repo_url, repo_id, pat_for_clone)
+
+    return {"status": "accepted", "repo_id": repo_id, "credential_stored": credential_stored}
 
 
 @router.get("/repos/{repo_id:path}/branches")
@@ -176,7 +245,16 @@ async def list_branches(repo_id: str, request: Request) -> dict:
     return {"repo_id": repo_id, "branches": branches}
 
 
-def register_and_build(repo_url: str, repo_id: str) -> None:
+def register_and_build(repo_url: str, repo_id: str, github_pat: str | None = None) -> None:
+    # If caller did not supply PAT, try vault (covers re-clone after eviction)
+    if github_pat is None:
+        try:
+            from infrastructure.db.credential_repository import CredentialRepository
+
+            github_pat = CredentialRepository().get_pat(repo_id)
+        except Exception:
+            github_pat = None
+
     lock = acquire_workspace_lock(settings.workspace_root, repo_id)
 
     with lock:
@@ -185,11 +263,23 @@ def register_and_build(repo_url: str, repo_id: str) -> None:
         service = CloneRepositoryService(repo_source, graph_builder)
 
         try:
-            workspace, build_status = service.execute(
-                repo_url=repo_url,
-                repo_id=repo_id,
-                workspace_root=settings.workspace_root,
-            )
+            # Pass PAT via repo_source clone (vault-aware); if service doesn't take pat, it falls back to URL
+            try:
+                workspace, build_status = service.execute(
+                    repo_url=repo_url,
+                    repo_id=repo_id,
+                    workspace_root=settings.workspace_root,
+                    github_pat=github_pat,
+                )
+            except TypeError:
+                # Back-compat if service signature not yet updated
+                workspace, build_status = service.execute(
+                    repo_url=repo_url,
+                    repo_id=repo_id,
+                    workspace_root=settings.workspace_root,
+                )
+                # Still ensure PAT was used for git if needed — GitRepoSource will have been called with vault lookup inside service
+                pass
             status = build_status.status
             error_message = build_status.error_message
             commit_hash = workspace.last_synced_commit

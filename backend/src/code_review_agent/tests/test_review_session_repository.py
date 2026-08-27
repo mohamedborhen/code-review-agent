@@ -335,5 +335,67 @@ class ReviewSessionRepositoryTest(unittest.TestCase):
         self.assertEqual(self.repo.get_tool_calls(999), [])
 
 
+    # --- find_latest_by_conversation ----------------------------------------
+
+    def test_find_latest_by_conversation_returns_most_recent(self):
+        """Returns the most recent review (any status) for a conversation."""
+        # Create two reviews for the same conversation — older running, newer completed
+        older_id = self.repo.create(
+            repo_id="org/repo",
+            graph_commit_hash="aaa",
+            request_type="review",
+            model=None,
+            expected_agents=[],
+            conversation_id=10,
+            user_id="alice",
+        )
+        self.repo.mark_completed(older_id, duration_ms=100, dispatched_agents=[])
+        newer_id = self.repo.create(
+            repo_id="org/repo",
+            graph_commit_hash="bbb",
+            request_type="compliance_question",
+            model=None,
+            expected_agents=[],
+            conversation_id=10,
+            user_id="alice",
+        )
+        row = self.repo.find_latest_by_conversation(10, "alice")
+        self.assertIsNotNone(row)
+        self.assertEqual(row.id, newer_id)
+
+    def test_find_latest_by_conversation_enforces_user_id(self):
+        """Returns None when user_id doesn't match."""
+        self.repo.create(
+            repo_id="org/repo",
+            graph_commit_hash="aaa",
+            request_type="review",
+            model=None,
+            expected_agents=[],
+            conversation_id=10,
+            user_id="alice",
+        )
+        self.assertIsNone(self.repo.find_latest_by_conversation(10, "bob"))
+
+    def test_find_latest_by_conversation_returns_none_for_empty(self):
+        """Returns None when no reviews exist for the conversation."""
+        self.assertIsNone(self.repo.find_latest_by_conversation(999, "alice"))
+
+    def test_find_latest_by_conversation_includes_running(self):
+        """Finds a running review (not just completed)."""
+        session_id = self.repo.create(
+            repo_id="org/repo",
+            graph_commit_hash="aaa",
+            request_type="review",
+            model=None,
+            expected_agents=[],
+            conversation_id=10,
+            user_id="alice",
+        )
+        row = self.repo.find_latest_by_conversation(10, "alice")
+        self.assertIsNotNone(row)
+        self.assertEqual(row.id, session_id)
+        self.assertEqual(row.status, "running")
+
+
 if __name__ == "__main__":
     unittest.main()

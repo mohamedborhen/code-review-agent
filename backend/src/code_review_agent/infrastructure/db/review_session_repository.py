@@ -71,6 +71,16 @@ class ReviewSessionRepository:
                 ).order_by(ReviewSession.created_at.desc()).limit(1)
             ).first()
 
+    def find_latest_by_conversation(self, conversation_id: int, user_id: str) -> ReviewSession | None:
+        """Find the most recent review (any status) for a conversation."""
+        with Session(engine) as s:
+            return s.exec(
+                select(ReviewSession).where(
+                    ReviewSession.conversation_id == conversation_id,
+                    ReviewSession.user_id == user_id,
+                ).order_by(ReviewSession.created_at.desc()).limit(1)
+            ).first()
+
     def mark_completed(
         self, session_id: int, *, duration_ms: int, dispatched_agents: list[str]
     ) -> None:
@@ -169,6 +179,8 @@ class ReviewSessionRepository:
                 {
                     "agent_name": r.agent_name,
                     "tool_name": r.tool_name,
+                    "tool_input": r.tool_input,
+                    "tool_output": r.tool_output,
                     "tool_latency_ms": r.tool_latency_ms,
                     "tool_status": r.tool_status,
                     "created_at": r.created_at.isoformat() if r.created_at else None,

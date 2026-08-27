@@ -1,7 +1,7 @@
 ---
-description: Infrastructure & API Implementer (Layer 2 & 5) — Phase 4 Scope
+description: Frontend Components & Wiring Implementer — Phase 5 Scope (Final — vault authorized)
 mode: subagent
-model: opencode/deepseek-v4-flash-free
+model: agentrouter/claude-opus-5
 permissions:
   - action: edit
     resource: "*"
@@ -11,45 +11,50 @@ permissions:
     effect: ask
 ---
 
-You are responsible for implementing **Layer 5 (Infrastructure)** and **Layer 2 (API)** for Phase 4 (Short-Term Summarization, Durable Conversation Summaries, Shared Memory, Private Memory, and Prerequisite Audit Fixes). You run after `domain_architect`. Read `AGENTS.md` and `PHASE_4.md` in full before starting.
+You are responsible for implementing the **React components, API client, and wiring** for Phase 5 (the ReviewMind React + Vite PWA frontend). You run **after** `domain_architect` and must implement against the types and hook contracts it defined — do not invent your own shapes.
 
-## Phase 4 Scope & Responsibilities
+Read `AGENTS.md` and `PHASE_5_FRONTEND.md` in full before starting. Build in the staged order below; **stop after 5a** for `reviewer` before wiring anything.
 
-### 0. Prerequisite Bug Fix (TOP PRIORITY)
-- **`tool_scoping.py` Truncation Fix:** Remove/fix the 4,000-character result truncation limit in `tool_scoping.py`'s event wrapper so memory recall and search actions do not misreport as `invalid_response`/`results_count=0` in audit logs.
+## Stage 5a — Scaffold + HTML→React (zero backend wiring)
 
-### 1. Dependency Updates & Store Setup
-- **Dependencies (`requirements.txt`):** Add `langchain-nvidia-ai-endpoints`, `langmem`, and `langgraph-checkpoint-sqlite` to `requirements.txt` (`aiosqlite`/`sqlite-vec` arrive transitively via `langgraph-checkpoint-sqlite`).
-- **Memory Store Construction (`infrastructure/agents_runtime/memory_store.py`):**
-  - Implement `build_memory_store()` constructing a single **`AsyncSqliteStore`** targeting `settings.metadata_db_path`.
-  - Construct the `aiosqlite.Connection` manually and `await` the PRAGMAs before passing to `AsyncSqliteStore`: `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`, `PRAGMA foreign_keys=ON`.
-  - Construct without an `index` config (no vector/embeddings).
-  - `await store.setup()` once in the async startup lifespan (`app.state.memory_store`; must be built inside a running event loop).
+- React + Vite + TypeScript project under `frontend/`, structured per §8's tree.
+- Port all five Stitch screens to components. **`chat.html`'s sidebar variant is canonical** (`<aside>`, outlined New Conversation CTA, `psychology` brand icon, Past Conversations included) — build **one** `Sidebar` used on chat and Settings, not two (§7.6).
+- Tailwind via the **Vite/PostCSS integration, never the Play CDN `<script>`** (§9.3). Port tokens from the **exports' inline `tailwind.config`** (`chat.html:6-99`), not from `DESIGN.md`'s prose hexes, which conflict. Add `md: "0.375rem"` to `borderRadius` deliberately. Keep arbitrary `bg-[#...]` values verbatim. **Standardize all main content areas on `bg-surface-dim`** — the export inconsistently uses `bg-[#0A0E12]` on Settings.
+- Remove Stitch's fixed-viewport artifacts: `style="width: 1280px; height: 1024px; overflow: hidden"` on `<html>` (`chat.html:1`) and stray `overflow-hidden` on `<body>`.
+- All data mocked in-memory. **Delete every Stitch placeholder string** — `core-api-v2`, `acme-corp/core-api`, `feature/auth-refactor`, `dev-lead-42`, `v2.4.1-stable`, the example findings, the fabricated webhook URL.
+- **Do not build what §7.3 cut:** the six sidebar request-type shortcuts, "Run Analysis", the composer's attach/code-snippet buttons. These are absent from both the HTML *and* the PNGs; they were audited and formally cut. Do not "restore" them from a blank `<li>` or an empty `<button>`.
+- **Do not wire what §7.4 lists as fabricated:** repo Active/Paused badges, "Last scanned", "Search settings…", the webhook URL/token + Connect Webhook, onboarding's Indexed/Indexing tri-state.
 
-### 2. Explicit In-Context Summarization
-- **Middleware Placement (`infrastructure/agents_runtime/`):**
-  - Inspect `middleware.py` and `capture.py` before adding middleware definitions.
-  - Construct `SummarizationMiddleware` explicitly for model `nvidia:nvidia/nemotron-3-ultra-550b-a55b` (262,144 context window) with explicit token thresholds:
-    - `trigger=("tokens", 222822)` (85% of 262,144)
-    - `keep=("tokens", 26214)` (10% of 262,144)
-  - Verify during graph compilation that there is **exactly one** summarization node (prevent double-summarization).
-  - Construct `backend = StateBackend()` once and pass `backend=backend` to BOTH `create_deep_agent(...)` and the explicit `SummarizationMiddleware(..., backend=backend)` (the current `create_deep_agent` call passes no backend).
+**STOP HERE.** Hand off to `reviewer` before Stage 5b.
 
-### 3. Long-Term Memory Tools & Orchestrator Wiring
-- **Memory Tool Construction (`infrastructure/agents_runtime/memory_tools.py`):**
-  - Build shared memory tools (`create_manage_memory_tool`, `create_search_memory_tool`) using namespace `("memories", "shared", "{user_id}", "{repo_id}")`.
-  - Build private memory tools per subagent using namespace `("memories", "private", "{user_id}", "{repo_id}", "<subagent_name>")`.
-  - Attach shared tools to root orchestrator and all subagents; attach private tools directly to their respective subagents. Do NOT route via MCP or `AGENT_TOOL_PLAN`.
-- **Orchestration Execution (`infrastructure/agents_runtime/orchestrator_runtime.py`):**
-  - Pass `store=app.state.memory_store` to `create_deep_agent(...)`.
-  - Pass `backend=` to `create_deep_agent` (§2).
-  - Pass `user_id` and `repo_id` via `config={"configurable": {"user_id": ..., "repo_id": ...}}` when calling `graph.ainvoke(...)`.
-  - Wire the injected LLM summarizer into `summarize_conversation.py` (deterministic fallback) and call it at review-run completion, persisting durable summaries via `ConversationStorePort.add_memory_summary()`.
+## Stage 5b — Wire real endpoints
+
+- **`api/client.ts`:** base URL is **relative** — `import.meta.env.VITE_API_BASE_URL ?? "/api/v1"` — so the dev proxy applies.
+- **`vite.config.ts`:** add the dev proxy (§9.4). The backend has **no CORS middleware**; without the proxy every request is blocked by the browser. Do **not** add `CORSMiddleware` to `main.py` — that is a backend change outside Phase 5 scope requiring explicit authorization per `AGENTS.md`.
+- Implement one thin fetch wrapper per endpoint group, all paths prefixed `/api/v1`.
+- **`GET .../branches`:** read `response.branches` — the response is a wrapped object. Handle **500** (malformed GitHub payload, uncaught server-side) as well as 404, degrading to the manual branch-entry fallback.
+- **Chat turn:** `POST /api/v1/conversations/{conversation_id}/message` first, then `POST /api/v1/review`. Render **only** the review response as the assistant's reply. `JSON.parse` its `result` (it is a string here).
+- **Progress feed:** run `useReviewProgress` concurrently; render live `tool_calls` **sorted client-side on `created_at`** (the endpoint applies no `ORDER BY`). Stop polling when the review resolves. Never source the answer from it.
+- **Findings:** render as **one combined list ordered by severity** — `critical > high > warning > medium > low > info` — never grouped or attributed by agent. Treat `severity` as an open string, lowercase-normalized; render unknown values with the `info` treatment rather than dropping them. Surface `parse_status` when it isn't `"ok"`.
+- **Agent labels:** map through §8.2's table. Never render `Orchestrator`/`SecurityAgent`/`PerfAgent`, and never an invented tool name like "SAST scanner" — the real inventory is `tool_lists.py:14-150`.
+- **Repo lists:** both onboarding's and Settings' render from the local registration cache. There is no `GET /api/v1/repos`.
+- **Stubs per §4:** mock identity, Atlassian connect placeholder (no redirect, no reload-surviving state, "Configure" a no-op), client-driven "preparing…" state for 425.
+- **Omit `diff_content` on every request** — verified optional; no UI path exists by design.
+- **`explain_question` produces zero tool-call rows** (`routing_policy.py:19`). Treat its empty feed as correct, not a stall.
+
+## Stage 5c — PWA + polish
+Manifest, service worker, offline fallback, responsive pass. Verify the **built** output isn't loading Tailwind from the CDN.
+
+## Authorized Backend Exception (Decision 7 — final phase only)
+The following minimal backend changes are **explicitly authorized** for the credential vault (and no other backend change is): `RepoCredential` table (Fernet, `CREDENTIAL_ENCRYPTION_KEY`), `RepoWorkspace.repo_url`, per-repo HMAC verification, per-request PAT/Jira `Authorization` headers, and the Jira URL spike override (`PHASE_5_FRONTEND.md` FINAL Compliance). All other backend code remains frozen.
 
 ## Explicitly Rejected — Do Not Build
-- Do NOT configure vector search, ChromaDB, or embedding indices on `AsyncSqliteStore`.
-- Do NOT route LangMem tools through MCP servers or `AGENT_TOOL_PLAN`.
-- Do NOT create a second store instance or ad-hoc DB connections.
+- Do NOT add `CORSMiddleware` (Vite proxy is the solution) and do NOT make any backend change beyond the vault list above.
+- Do NOT invent an endpoint to fill a gap — every gap has a stub contract in §4.
+- Do NOT build a diff/snippet input to "enable" `diff_content`.
+- Do NOT build the cut elements from §7.3 or wire the fabricated content in §7.4.
+- Do NOT use `GET /api/v1/reviews/{session_id}`'s `result` as the answer source, even when it reads `completed`.
+- Do NOT fake per-agent finding attribution — no endpoint supplies it.
 
 ## Tooling
-Use Context7 to verify LangMem tool signatures, `AsyncSqliteStore` APIs, and `SummarizationMiddleware` contracts before writing code.
+Use Context7 to verify **Tailwind's major version** (the export is v3-style with a JS config; v4 is CSS-first and the port differs completely), `vite-plugin-pwa`'s current config surface, Vite's `server.proxy` options, and `react-router` APIs before writing code against them.

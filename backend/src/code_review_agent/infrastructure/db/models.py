@@ -136,10 +136,11 @@ class MemorySummary(SQLModel, table=True):
 
 
 class ReviewToolCall(SQLModel, table=True):
-    """Metadata-only audit of tool calls made during a review session.
+    """Audit of tool calls made during a review session.
 
-    Persisted best-effort inside _wrap_with_events. No tool_input or
-    tool_output — only timing, agent identity, tool name, and status.
+    Persisted best-effort inside _wrap_with_events. Stores truncated,
+    sanitized tool_input and tool_output — secrets are redacted and data
+    is capped at 2000 chars before persisting.
     """
 
     __tablename__ = "ReviewToolCall"
@@ -151,6 +152,8 @@ class ReviewToolCall(SQLModel, table=True):
     review_session_id: int = Field(foreign_key="reviewsession.id", ondelete="CASCADE", index=True)
     agent_name: str
     tool_name: str
+    tool_input: str | None = None
+    tool_output: str | None = None
     tool_latency_ms: int | None = None
     tool_status: str | None = None  # 'success' | 'error'
     created_at: datetime = Field(default_factory=_utcnow)

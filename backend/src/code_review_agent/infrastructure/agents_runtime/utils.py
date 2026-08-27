@@ -8,12 +8,33 @@ capture.py, report_parse.py, branch_resolution.py, and context_agent_runtime.py.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+# Patterns that look like secrets/tokens — redact before persisting.
+_SECRET_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"ghp_[A-Za-z0-9]{36}"),          # GitHub PAT
+    re.compile(r"github_pat_[A-Za-z0-9_]{82}"),   # GitHub fine-grained PAT
+    re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
+    re.compile(r"Basic\s+[A-Za-z0-9+/]+=*", re.IGNORECASE),
+    re.compile(r"xoxb-[A-Za-z0-9\-]+"),           # Slack bot token
+    re.compile(r"AKIA[0-9A-Z]{16}"),              # AWS access key
+]
+
+_REDACTED = "[REDACTED]"
 
 
 def truncate(text: str, limit: int = 2000) -> str:
     """Truncate text to limit, appending '...(truncated)' if needed."""
     return text if len(text) <= limit else text[:limit] + "...(truncated)"
+
+
+def sanitize_for_storage(text: str, limit: int = 2000) -> str:
+    """Redact known secret patterns then truncate for safe DB storage."""
+    redacted = text
+    for pat in _SECRET_PATTERNS:
+        redacted = pat.sub(_REDACTED, redacted)
+    return truncate(redacted, limit)
 
 
 def findings_list(raw: dict) -> list | None:

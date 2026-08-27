@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from "react-router-dom";
-import { loadIdentity } from "./state/identity";
+import { useState } from "react";
+import { loadIdentity, type Identity } from "./state/identity";
 import { SidebarProvider } from "./state/sidebar";
 import SignIn from "./pages/SignIn";
 import Onboarding from "./pages/Onboarding";
@@ -7,12 +8,12 @@ import MainChat from "./pages/MainChat";
 import Settings from "./pages/Settings";
 
 function App() {
-  const identity = loadIdentity();
+  const [identity, setIdentity] = useState<Identity | null>(() => loadIdentity());
 
   if (!identity) {
     return (
       <Routes>
-        <Route path="*" element={<SignIn />} />
+        <Route path="*" element={<SignIn onIdentityCreated={setIdentity} />} />
       </Routes>
     );
   }

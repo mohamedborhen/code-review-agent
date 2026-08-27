@@ -87,3 +87,17 @@
 - `docs/REVIEW_ASYNC_ARCHITECTURE.md` — async architecture design
 - `PHASE_4_E2E_TEST_REPORT.md` — updated with verified results
 - `OPENCODE.md` — this file
+
+## Blockers / Pending Questions — Phase 5 Final (2026-08-25)
+
+### CORS — decision: not adding to backend at this stage
+- **Verified:** `backend/src/code_review_agent/main.py:28-52` has no `CORSMiddleware`/`add_middleware`; grep across `backend/` returns 0 matches. Verified against live source in Phase 5 audit (20/29/28 checks).
+- **Decision per user (2026-08-25):** Do **not** add `CORSMiddleware` to `main.py` in final phase.
+- **Resolution:** Vite dev proxy `server.proxy {"/api/v1": {target:"http://127.0.0.1:8000", changeOrigin:true}}` (`PHASE_5_FRONTEND.md:1498-1531 §9.4`, `frontend/vite.config.ts`) handles dev. Production caveat is documented in `PHASE_5_FRONTEND.md:1192-1212 §8.4` — built assets must be served same-origin or behind a reverse proxy; adding CORS later requires explicit backend authorization per `AGENTS.md:9-12` (backend frozen in Phase 5).
+- **Status:** logged, not a blocker to start 5a.
+
+### Infra model — resolved
+- `opencode/mimo-v2.5-free` probed 429, `opencode/muse-spark-1.2-contributor-free` probed 500 (2026-08-25 live probes). Final models verified PASS: `opencode/muse-spark-1.2-contributor-free` initially 500 then re-probed — user reset to `agentrouter/claude-opus-5` ×3 which probes HTTP 200 stream. Log entry closed.
+
+### Jira URL inheritance spike — blocking before wiring
+- `mcp_atlassian@0.23.0` `UserTokenMiddleware._parse_auth_header:699-728` supports `Basic base64(email:token)` → `dependencies.py:884-914` creates user-scoped `JiraFetcher`, but `dependencies.py:697` inherits `url: base_config.url` from global. Spike must live-probe header round-trip with dummy global `JIRA_URL` before wiring per-user headers (PHASE_5_FRONTEND.md FINAL Compliance / Gaps).

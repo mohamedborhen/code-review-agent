@@ -1,19 +1,43 @@
+import base64
+import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 from domain.repo.repo_source_port import RepoSourcePort
 
 
+def _force_rmtree(path: str | Path) -> None:
+    """Recursively delete ``path``, clearing read-only bits as needed.
+
+    ``git`` marks loose objects under ``.git/objects/`` read-only. On Windows a
+    plain ``shutil.rmtree`` raises ``PermissionError: [WinError 5]`` on those
+    files, so every re-clone over an existing workspace failed. Clearing the
+    read-only bit in the error handler and retrying is the portable fix; on
+    POSIX the handler is simply never reached.
+    """
+    target = Path(path)
+    if not target.exists():
+        return
+
+    def _on_error(func, failed_path, _exc_info):  # pragma: no cover - branch is OS-dependent
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+
+    shutil.rmtree(target, onerror=_on_error)
+
+
 def _run_git(args: list[str], cwd: str, pat: str | None = None) -> str:
     """Run a git command with optional PAT injection via http.extraHeader.
 
-    PAT is injected via ``-c http.extraHeader=Authorization: Bearer <pat>``
+    PAT is injected via ``-c http.extraHeader=Authorization: Basic <base64>``
     rather than embedded in the URL (which leaks into .git/config).
     """
     cmd = ["git"]
     if pat:
-        cmd.extend(["-c", f"http.extraHeader=Authorization: Bearer {pat}"])
+        credentials = base64.b64encode(f"x-access-token:{pat}".encode("ascii")).decode("ascii")
+        cmd.extend(["-c", f"http.extraHeader=Authorization: Basic {credentials}"])
     cmd.extend(args)
     result = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True
@@ -59,7 +83,7 @@ class GitRepoSource(RepoSourcePort):
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         if target_path.exists():
-            shutil.rmtree(target_path)
+            _force_rmtree(target_path)
 
         _run_git(
             ["clone", "--depth", "1", repo_url, str(target_path)],

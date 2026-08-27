@@ -72,8 +72,10 @@ class Settings(BaseSettings):
     # Fernet encryption key for storing github_pat, webhook_secret, and jira_api_token
     # encrypted at rest in the RepoCredential table. 32-byte base64 URL-safe string;
     # generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-    # Must be set in the environment — no default, no fallback.
-    credential_encryption_key: str
+    # In production must be set via env CREDENTIAL_ENCRYPTION_KEY; in dev/test an
+    # ephemeral key is generated (vault rows become unreadable after restart — add
+    # the key to .env to persist).
+    credential_encryption_key: str | None = None
 
     # mcp-atlassian auth (Cloud API tokens). These are handed to the mcp-atlassian
     # process as its own env vars (see run_atlassian_server.sh / docker-compose),

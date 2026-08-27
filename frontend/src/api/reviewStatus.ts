@@ -13,6 +13,18 @@ export async function getRunningReview(
   );
 }
 
+// GET /api/v1/reviews/latest?conversation_id={int}&user_id={str}
+// Returns the most recent review (any status) for a conversation.
+// Same shape as GET /reviews/{session_id}. Used for reconnection after navigation.
+export async function getLatestReview(
+  conversationId: number,
+  userId: string,
+): Promise<ReviewStatusResponse | { review_session_id: null; status: null }> {
+  return apiFetch<ReviewStatusResponse | { review_session_id: null; status: null }>(
+    `/reviews/latest?conversation_id=${conversationId}&user_id=${encodeURIComponent(userId)}`,
+  );
+}
+
 // GET /api/v1/reviews/{session_id}?user_id={str}
 // §2: user_id required. 404 if session_id doesn't exist OR user_id mismatch.
 // tool_calls: exactly 5 keys per item, NO ORDER BY — sort client-side on created_at

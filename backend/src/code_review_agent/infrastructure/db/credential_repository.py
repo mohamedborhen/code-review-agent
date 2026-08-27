@@ -17,9 +17,22 @@ from infrastructure.db.models import RepoCredential
 logger = logging.getLogger(__name__)
 
 
+_EPHEMERAL_KEY: bytes | None = None
+
+
 def _fernet() -> Fernet:
-    """Return a Fernet instance from the configured encryption key."""
+    """Return a Fernet instance from the configured encryption key.
+
+    If CREDENTIAL_ENCRYPTION_KEY is not set (dev/test), an ephemeral key is
+    generated once per process and reused — vault rows won't survive restart.
+    """
+    global _EPHEMERAL_KEY
     key = settings.credential_encryption_key
+    if key is None:
+        if _EPHEMERAL_KEY is None:
+            _EPHEMERAL_KEY = Fernet.generate_key()
+            logger.warning("CREDENTIAL_ENCRYPTION_KEY not set — using ephemeral Fernet key (vault not persistent)")
+        return Fernet(_EPHEMERAL_KEY)
     if isinstance(key, str):
         key = key.encode("utf-8")
     return Fernet(key)
@@ -163,6 +176,20 @@ class CredentialRepository:
                 "jira_email": cred.jira_email,
                 "jira_api_token": token,
             }
+
+    def get_by_repo_id(self, repo_id: str) -> dict | None:
+        """Return ownership dict for a repo, or None if not found.
+
+        Returns {owning_user_id: str, repo_id: str}. Used for 409 hijack check.
+        Does NOT return credential ciphertext.
+        """
+        with Session(engine) as session:
+            cred = session.exec(
+                select(RepoCredential).where(RepoCredential.repo_id == repo_id)
+            ).first()
+            if cred is None:
+                return None
+            return {"owning_user_id": cred.owning_user_id, "repo_id": cred.repo_id}
 
     def get_all_by_user(self, user_id: str) -> list[dict]:
         """Return list of {repo_id} for all repos owned by a user.

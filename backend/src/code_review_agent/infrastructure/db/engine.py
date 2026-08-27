@@ -58,6 +58,9 @@ def _add_model_columns() -> None:
             # review status endpoints (Issue 1)
             ("reviewsession", "conversation_id", "INTEGER"),
             ("reviewsession", "user_id", "TEXT"),
+            # tool result persistence (Issue 2 — ReviewToolCall input/output)
+            ("reviewtoolcall", "tool_input", "TEXT"),
+            ("reviewtoolcall", "tool_output", "TEXT"),
         ]
         for table, column, sql_type in column_defs:
             cols = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}

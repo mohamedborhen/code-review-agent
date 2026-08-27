@@ -1,6 +1,6 @@
 """Tests for the shared utility functions in infrastructure.agents_runtime.utils."""
 
-from infrastructure.agents_runtime.utils import extract_text, findings_list, truncate
+from infrastructure.agents_runtime.utils import extract_text, findings_list, sanitize_for_storage, truncate
 
 
 class TestTruncate:
@@ -70,3 +70,56 @@ class TestExtractText:
         class FakeResult:
             content = None
         assert extract_text(FakeResult()) == ""
+
+
+class TestSanitizeForStorage:
+    def test_no_secrets_unchanged(self):
+        text = "query_graph(query='find callers of foo')"
+        assert sanitize_for_storage(text) == text
+
+    def test_truncation_applied(self):
+        text = "a" * 2500
+        result = sanitize_for_storage(text, limit=100)
+        assert len(result) == 100 + len("...(truncated)")
+        assert result.endswith("...(truncated)")
+
+    def test_github_pat_redacted(self):
+        text = "token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"
+        result = sanitize_for_storage(text)
+        assert "ghp_" not in result
+        assert "[REDACTED]" in result
+
+    def test_github_fine_grained_pat_redacted(self):
+        token = "github_pat_" + "A" * 82
+        text = f"auth: {token}"
+        result = sanitize_for_storage(text)
+        assert token not in result
+        assert "[REDACTED]" in result
+
+    def test_bearer_token_redacted(self):
+        text = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret"
+        result = sanitize_for_storage(text)
+        assert "eyJhbGci" not in result
+        assert "[REDACTED]" in result
+
+    def test_basic_auth_redacted(self):
+        text = "Authorization: Basic dXNlcjpwYXNz"
+        result = sanitize_for_storage(text)
+        assert "dXNlcjpwYXNz" not in result
+        assert "[REDACTED]" in result
+
+    def test_aws_key_redacted(self):
+        text = "key=AKIAIOSFODNN7EXAMPLE"
+        result = sanitize_for_storage(text)
+        assert "AKIAIOSFODNN7EXAMPLE" not in result
+        assert "[REDACTED]" in result
+
+    def test_empty_string(self):
+        assert sanitize_for_storage("") == ""
+
+    def test_redaction_before_truncation(self):
+        long_secret = "ghp_" + "X" * 2500
+        result = sanitize_for_storage(long_secret, limit=50)
+        assert "ghp_" not in result
+        assert "[REDACTED]" in result
+        assert len(result) == 50 + len("...(truncated)")

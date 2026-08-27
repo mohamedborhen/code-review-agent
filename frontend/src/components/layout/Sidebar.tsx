@@ -1,3 +1,4 @@
+import { useState, useRef, useEffect } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { useSidebar } from "../../state/sidebar";
 
@@ -5,16 +6,54 @@ interface SidebarProps {
   conversations?: { conversation_id: number; title: string; repo_id: string }[];
   onNewConversation?: () => void;
   onSelectConversation?: (id: number) => void;
+  onRenameConversation?: (id: number, title: string) => void;
+  onDeleteConversation?: (id: number) => void;
 }
 
 export default function Sidebar({
   conversations = [],
   onNewConversation,
   onSelectConversation,
+  onRenameConversation,
+  onDeleteConversation,
 }: SidebarProps) {
   const location = useLocation();
   const isSettings = location.pathname === "/settings";
   const { isOpen, close } = useSidebar();
+
+  const [menuOpenId, setMenuOpenId] = useState<number | null>(null);
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const menuRef = useRef<HTMLDivElement>(null);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (renamingId !== null && renameInputRef.current) {
+      renameInputRef.current.focus();
+      renameInputRef.current.select();
+    }
+  }, [renamingId]);
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpenId(null);
+      }
+    }
+    if (menuOpenId !== null) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [menuOpenId]);
+
+  function handleRenameSubmit(id: number) {
+    const trimmed = renameValue.trim();
+    if (trimmed && onRenameConversation) {
+      onRenameConversation(id, trimmed);
+    }
+    setRenamingId(null);
+    setMenuOpenId(null);
+  }
 
   return (
     <>
@@ -50,7 +89,7 @@ export default function Sidebar({
           </div>
         </div>
 
-        {/* New Conversation CTA — outlined variant per chat.html */}
+        {/* New Conversation CTA */}
         <button
           onClick={() => {
             onNewConversation?.();
@@ -76,16 +115,80 @@ export default function Sidebar({
             {conversations.map((c) => (
               <div
                 key={c.conversation_id}
-                onClick={() => {
-                  onSelectConversation?.(c.conversation_id);
-                  close();
-                }}
                 className="group px-4 py-2 rounded hover:bg-surface-container-high cursor-pointer transition-colors"
               >
-                <p className="font-body-sm text-on-surface truncate">{c.title}</p>
-                <span className="inline-block mt-1 px-1.5 py-0.5 bg-surface-container-highest text-[10px] font-label-caps rounded text-on-surface-variant">
-                  {c.repo_id.split("/").pop()}
-                </span>
+                {renamingId === c.conversation_id ? (
+                  <input
+                    ref={renameInputRef}
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onBlur={() => handleRenameSubmit(c.conversation_id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleRenameSubmit(c.conversation_id);
+                      if (e.key === "Escape") {
+                        setRenamingId(null);
+                        setMenuOpenId(null);
+                      }
+                    }}
+                    className="w-full bg-surface-container-highest border border-primary-container rounded px-2 py-0.5 text-body-sm text-on-surface focus:outline-none"
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                ) : (
+                  <div
+                    onClick={() => {
+                      onSelectConversation?.(c.conversation_id);
+                      close();
+                    }}
+                    className="flex items-center justify-between"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="font-body-sm text-on-surface truncate">{c.title}</p>
+                      <span className="inline-block mt-1 px-1.5 py-0.5 bg-surface-container-highest text-[10px] font-label-caps rounded text-on-surface-variant">
+                        {c.repo_id.split("/").pop()}
+                      </span>
+                    </div>
+                    <div className="relative" ref={menuOpenId === c.conversation_id ? menuRef : undefined}>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setMenuOpenId(menuOpenId === c.conversation_id ? null : c.conversation_id);
+                        }}
+                        className="opacity-0 group-hover:opacity-100 text-on-surface-variant hover:text-on-surface p-1 rounded transition-opacity"
+                      >
+                        <span className="material-symbols-outlined text-[16px]">more_vert</span>
+                      </button>
+                      {menuOpenId === c.conversation_id && (
+                        <div className="absolute right-0 top-full mt-1 w-36 bg-surface-container-high border border-outline-variant rounded-lg shadow-lg z-50 py-1">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setRenamingId(c.conversation_id);
+                              setRenameValue(c.title);
+                              setMenuOpenId(null);
+                            }}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-body-sm text-on-surface hover:bg-surface-container-highest transition-colors"
+                          >
+                            <span className="material-symbols-outlined text-[16px]">edit</span>
+                            Rename
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (window.confirm("Delete this conversation?")) {
+                                onDeleteConversation?.(c.conversation_id);
+                              }
+                              setMenuOpenId(null);
+                            }}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-body-sm text-error hover:bg-surface-container-highest transition-colors"
+                          >
+                            <span className="material-symbols-outlined text-[16px]">delete</span>
+                            Delete
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -104,14 +207,6 @@ export default function Sidebar({
           >
             <span className="material-symbols-outlined text-[20px]">settings</span>
             <span className="font-label-caps text-label-caps">Settings</span>
-          </Link>
-          <Link
-            to="/settings"
-            onClick={close}
-            className="flex items-center gap-3 px-4 py-2 text-on-surface-variant hover:bg-surface-container-high transition-colors duration-150 rounded"
-          >
-            <span className="material-symbols-outlined text-[20px]">account_circle</span>
-            <span className="font-label-caps text-label-caps">Account</span>
           </Link>
         </div>
       </aside>

@@ -173,13 +173,16 @@ async def review(
     # the client so subsequent get_tools() calls connect fresh.  The probe is
     # intentionally cheap — a single get_tools() call that succeeds or fails
     # fast; full tool acquisition happens later inside scope_agent_tools.
-    try:
-        await request.app.state.mcp_client.get_tools(server_name="atlassian")
-    except Exception:
-        logger.warning("Atlassian MCP unreachable — rebuilding client (D-12)")
-        from infrastructure.mcp_clients.mcp_client_factory import rebuild_mcp_client
+    #
+    # Per-user Jira: always rebuild with user-specific headers so the
+    # X-Atlassian-Jira-Url and Authorization headers reach mcp-atlassian.
+    # Our monkey-patch (mcp_jira_patch.py) ensures the user URL overrides
+    # base_config.url inside _create_user_config_for_fetcher.
+    from infrastructure.mcp_clients.mcp_client_factory import rebuild_mcp_client
+    from infrastructure.api.routes.integrations import build_jira_headers_for_user
 
-        request.app.state.mcp_client = await rebuild_mcp_client()
+    jira_headers = build_jira_headers_for_user(body.user_id, body.repo_id) if body.user_id and body.repo_id else None
+    request.app.state.mcp_client = await rebuild_mcp_client(jira_headers=jira_headers)
 
     orchestrator = OrchestratorRuntime(
         request.app.state.mcp_client,
@@ -284,6 +287,39 @@ async def find_running_review(conversation_id: int, user_id: str) -> dict:
         "review_session_id": row.id,
         "status": row.status,
         "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.get("/reviews/latest")
+async def find_latest_review(conversation_id: int, user_id: str) -> dict:
+    """Find the most recent review (any status) for a conversation.
+
+    Used by the frontend to reconnect to a completed or running review
+    after navigation away and back. Returns the same shape as
+    GET /reviews/{session_id}.
+    """
+    row = await asyncio.to_thread(
+        _review_repo.find_latest_by_conversation, conversation_id, user_id
+    )
+    if row is None:
+        return {"review_session_id": None, "status": None}
+    result = None
+    if row.status == "completed":
+        raw = await asyncio.to_thread(_review_repo.get_aggregated_result, row.id)
+        if raw is not None:
+            result = json.loads(raw)
+    tool_calls = await asyncio.to_thread(_review_repo.get_tool_calls, row.id)
+    return {
+        "review_session_id": row.id,
+        "status": row.status,
+        "repo_id": row.repo_id,
+        "request_type": row.request_type,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "duration_ms": row.duration_ms,
+        "error": row.error,
+        "result": result,
+        "tool_calls": tool_calls,
     }
 
 

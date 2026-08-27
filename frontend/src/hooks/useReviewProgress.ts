@@ -13,10 +13,10 @@ export function useReviewProgress() {
   const [isPolling, setIsPolling] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
-  const startPolling = useCallback((conversationId: number, userId: string) => {
+  const startPolling = useCallback((conversationId: number, userId: string, onSessionFound?: (sessionId: number) => void, preserveExisting?: boolean) => {
     const controller = new AbortController();
     abortRef.current = controller;
-    setToolCalls([]);
+    if (!preserveExisting) setToolCalls([]);
     setIsPolling(true);
 
     (async () => {
@@ -29,6 +29,8 @@ export function useReviewProgress() {
           sessionId = running.review_session_id;
           if (sessionId === null) {
             await sleep(1500); // review row not committed yet — small window, retry
+          } else if (onSessionFound) {
+            onSessionFound(sessionId);
           }
         } catch {
           if (controller.signal.aborted) break;

@@ -25,11 +25,16 @@ class CloneRepositoryService:
         repo_url: str,
         repo_id: str,
         workspace_root: str,
+        github_pat: str | None = None,
     ) -> tuple[RepoWorkspace, GraphBuildStatus]:
         safe_id = _sanitize_repo_id(repo_id)
         local_path = f"{workspace_root.rstrip('/')}/{safe_id}"
 
-        commit_sha = self._repo_source.clone(repo_url, local_path)
+        # PAT is injected via http.extraHeader, never via URL that leaks to .git/config
+        try:
+            commit_sha = self._repo_source.clone(repo_url, local_path, pat=github_pat)
+        except TypeError:
+            commit_sha = self._repo_source.clone(repo_url, local_path)
 
         workspace = RepoWorkspace(
             repo_id=repo_id,

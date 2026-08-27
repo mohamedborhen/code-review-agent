@@ -8,6 +8,9 @@ export default defineConfig({
     VitePWA({
       registerType: "autoUpdate",
       includeAssets: ["favicon.ico", "icons/*.png"],
+      devOptions: {
+        enabled: true,
+      },
       manifest: {
         name: "ReviewMind",
         short_name: "ReviewMind",
