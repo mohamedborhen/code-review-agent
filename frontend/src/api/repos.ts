@@ -43,6 +43,49 @@ export function removeRegisteredRepo(repo_id: string): void {
   saveRepos(loadRepos().filter((r) => r.repo_id !== repo_id));
 }
 
+// --- Backend sync for account restore (Phase 5) ---
+
+/**
+ * Fetch repos from backend and populate localStorage.
+ * Used when restoring an account from another browser/session.
+ */
+export async function syncReposFromBackend(user_id: string): Promise<RegisteredRepo[]> {
+  try {
+    const response = await fetch(`/api/v1/accounts/repos?user_id=${encodeURIComponent(user_id)}`);
+    if (!response.ok) {
+      console.error("Failed to fetch repos from backend:", response.statusText);
+      return [];
+    }
+
+    const data = await response.json();
+    const backendRepos = data.repos ?? [];
+
+    // Map backend repos to frontend format
+    const repos: RegisteredRepo[] = backendRepos.map(
+      (repo: {
+        repo_id: string;
+        created_at: string | null;
+        has_github_pat: boolean;
+        has_webhook_secret: boolean;
+      }) => ({
+        repo_id: repo.repo_id,
+        repo_url: `https://github.com/${repo.repo_id}`,
+        display_name: repo.repo_id.split("/").pop(),
+        registered_at: repo.created_at ?? new Date().toISOString(),
+        webhook_configured: repo.has_webhook_secret,
+      })
+    );
+
+    // Save to localStorage (will be used by the hook)
+    saveRepos(repos);
+
+    return repos;
+  } catch (error) {
+    console.error("Failed to sync repos from backend:", error);
+    return [];
+  }
+}
+
 // POST /api/v1/repos — register a repository with credentials
 // §2: response is { status: "accepted", repo_id, credential_stored }
 export async function registerRepo(

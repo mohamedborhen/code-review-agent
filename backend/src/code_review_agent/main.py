@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from infrastructure.agents_runtime.memory_store import build_memory_store
+from infrastructure.api.routes.accounts import router as accounts_router
 from infrastructure.api.routes.conversation import router as conversation_router
 from infrastructure.api.routes.integrations import router as integrations_router
 from infrastructure.api.routes.review import router as review_router
@@ -56,3 +57,4 @@ app.include_router(webhook_router, prefix="/api/v1")
 app.include_router(review_router, prefix="/api/v1")
 app.include_router(conversation_router, prefix="/api/v1")
 app.include_router(integrations_router, prefix="/api/v1")
+app.include_router(accounts_router, prefix="/api/v1")

@@ -89,6 +89,48 @@ export function clearReviewState(conversationId: number): void {
   localStorage.removeItem(`reviewmind_tool_calls_v1_${conversationId}`);
 }
 
+// --- Backend sync for account restore (Phase 5) ---
+
+/**
+ * Fetch conversations from backend and populate localStorage.
+ * Used when restoring an account from another browser/session.
+ */
+export async function syncConversationsFromBackend(user_id: string): Promise<ConversationMeta[]> {
+  try {
+    const response = await fetch(`/api/v1/accounts/conversations?user_id=${encodeURIComponent(user_id)}`);
+    if (!response.ok) {
+      console.error("Failed to fetch conversations from backend:", response.statusText);
+      return [];
+    }
+
+    const data = await response.json();
+    const backendConversations = data.conversations ?? [];
+
+    // Map backend conversations to frontend format
+    const conversations: ConversationMeta[] = backendConversations.map(
+      (conv: {
+        conversation_id: number;
+        repo_id: string;
+        created_at: string | null;
+        message_count: number;
+      }) => ({
+        conversation_id: conv.conversation_id,
+        repo_id: conv.repo_id,
+        title: conv.repo_id.split("/").pop() ?? "Untitled", // Use repo name as default title
+        created_at: conv.created_at ?? new Date().toISOString(),
+      })
+    );
+
+    // Save to localStorage (will be used by the hook)
+    saveConversations(conversations);
+
+    return conversations;
+  } catch (error) {
+    console.error("Failed to sync conversations from backend:", error);
+    return [];
+  }
+}
+
 export function useConversationCache() {
   const [conversations, setConversations] = useState<ConversationMeta[]>(
     loadConversations,
