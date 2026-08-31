@@ -119,5 +119,7 @@ class EnsureBranchWorktreeService:
 
 
 def _resolve_worktree_path(workspace_root: str, repo_id: str, branch: str) -> str:
-    from infrastructure.workspace.workspace_path_resolver import resolve_worktree_path
-    return resolve_worktree_path(workspace_root, repo_id, branch)
+    from infrastructure.workspace.sanitize import sanitize_repo_id
+    safe_id = sanitize_repo_id(repo_id)
+    safe_branch = sanitize_repo_id(branch)
+    return f"{workspace_root.rstrip('/')}/{safe_id}__{safe_branch}"
