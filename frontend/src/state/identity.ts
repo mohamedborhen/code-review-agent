@@ -5,6 +5,7 @@
 // Supports local identity switching (NOT authentication).
 
 import type { AggregatedOutput } from "../types/api";
+import { apiFetch, ApiError } from "../api/client";
 
 const KEY = "reviewmind_identity_v1";
 const ACCOUNTS_KEY = "reviewmind_accounts_v1";
@@ -251,17 +252,12 @@ export interface BackendMessage {
  */
 export async function lookupAccount(user_id: string): Promise<AccountLookupResult | null> {
   try {
-    const response = await fetch(`/api/v1/accounts/lookup?user_id=${encodeURIComponent(user_id)}`);
-    if (response.status === 404) {
-      return null;
-    }
-    if (!response.ok) {
-      throw new Error(`Lookup failed: ${response.statusText}`);
-    }
-    return await response.json();
-  } catch (error) {
-    console.error("Account lookup failed:", error);
-    return null;
+    return await apiFetch<AccountLookupResult>(
+      `/accounts/lookup?user_id=${encodeURIComponent(user_id)}`
+    );
+  } catch (e: unknown) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
   }
 }
 
@@ -270,14 +266,12 @@ export async function lookupAccount(user_id: string): Promise<AccountLookupResul
  */
 export async function fetchBackendConversations(user_id: string): Promise<BackendConversation[]> {
   try {
-    const response = await fetch(`/api/v1/accounts/conversations?user_id=${encodeURIComponent(user_id)}`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch conversations: ${response.statusText}`);
-    }
-    const data = await response.json();
+    const data = await apiFetch<{ conversations: BackendConversation[] }>(
+      `/accounts/conversations?user_id=${encodeURIComponent(user_id)}`
+    );
     return data.conversations ?? [];
-  } catch (error) {
-    console.error("Failed to fetch backend conversations:", error);
+  } catch (e) {
+    console.error("Failed to fetch backend conversations:", e instanceof Error ? e.message : e);
     return [];
   }
 }
@@ -287,14 +281,12 @@ export async function fetchBackendConversations(user_id: string): Promise<Backen
  */
 export async function fetchBackendRepos(user_id: string): Promise<BackendRepo[]> {
   try {
-    const response = await fetch(`/api/v1/accounts/repos?user_id=${encodeURIComponent(user_id)}`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch repos: ${response.statusText}`);
-    }
-    const data = await response.json();
+    const data = await apiFetch<{ repos: BackendRepo[] }>(
+      `/accounts/repos?user_id=${encodeURIComponent(user_id)}`
+    );
     return data.repos ?? [];
-  } catch (error) {
-    console.error("Failed to fetch backend repos:", error);
+  } catch (e) {
+    console.error("Failed to fetch backend repos:", e instanceof Error ? e.message : e);
     return [];
   }
 }
@@ -304,14 +296,12 @@ export async function fetchBackendRepos(user_id: string): Promise<BackendRepo[]>
  */
 export async function fetchBackendReviews(user_id: string): Promise<BackendReview[]> {
   try {
-    const response = await fetch(`/api/v1/accounts/reviews?user_id=${encodeURIComponent(user_id)}`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch reviews: ${response.statusText}`);
-    }
-    const data = await response.json();
+    const data = await apiFetch<{ reviews: BackendReview[] }>(
+      `/accounts/reviews?user_id=${encodeURIComponent(user_id)}`
+    );
     return data.reviews ?? [];
-  } catch (error) {
-    console.error("Failed to fetch backend reviews:", error);
+  } catch (e) {
+    console.error("Failed to fetch backend reviews:", e instanceof Error ? e.message : e);
     return [];
   }
 }
@@ -324,16 +314,12 @@ export async function fetchBackendMessages(
   conversation_id: number,
 ): Promise<BackendMessage[]> {
   try {
-    const response = await fetch(
-      `/api/v1/accounts/conversations/${conversation_id}/messages?user_id=${encodeURIComponent(user_id)}`,
+    const data = await apiFetch<{ messages: BackendMessage[] }>(
+      `/accounts/conversations/${conversation_id}/messages?user_id=${encodeURIComponent(user_id)}`
     );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch messages: ${response.statusText}`);
-    }
-    const data = await response.json();
     return data.messages ?? [];
-  } catch (error) {
-    console.error("Failed to fetch backend messages:", error);
+  } catch (e) {
+    console.error("Failed to fetch backend messages:", e instanceof Error ? e.message : e);
     return [];
   }
 }

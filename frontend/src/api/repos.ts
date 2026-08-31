@@ -56,13 +56,13 @@ export function removeRegisteredRepo(repo_id: string): void {
  */
 export async function syncReposFromBackend(user_id: string): Promise<RegisteredRepo[]> {
   try {
-    const response = await fetch(`/api/v1/accounts/repos?user_id=${encodeURIComponent(user_id)}`);
-    if (!response.ok) {
-      console.error("Failed to fetch repos from backend:", response.statusText);
-      return [];
-    }
+    const data = await apiFetch<{ repos: Array<{
+      repo_id: string;
+      created_at: string | null;
+      has_github_pat: boolean;
+      has_webhook_secret: boolean;
+    }> }>(`/accounts/repos?user_id=${encodeURIComponent(user_id)}`);
 
-    const data = await response.json();
     const backendRepos = data.repos ?? [];
 
     // Map backend repos to frontend format

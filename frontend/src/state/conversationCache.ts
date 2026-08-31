@@ -2,6 +2,7 @@
 // Identity-scoped: each user_id has its own conversation list.
 import { useState, useCallback, useEffect } from "react";
 import { loadIdentity } from "./identity";
+import { apiFetch } from "../api/client";
 import type { RequestType, ReviewToolCallItem } from "../types/api";
 
 export interface ConversationMeta {
@@ -104,13 +105,13 @@ export function clearReviewState(conversationId: number): void {
  */
 export async function syncConversationsFromBackend(user_id: string): Promise<ConversationMeta[]> {
   try {
-    const response = await fetch(`/api/v1/accounts/conversations?user_id=${encodeURIComponent(user_id)}`);
-    if (!response.ok) {
-      console.error("Failed to fetch conversations from backend:", response.statusText);
-      return [];
-    }
+    const data = await apiFetch<{ conversations: Array<{
+      conversation_id: number;
+      repo_id: string;
+      created_at: string | null;
+      message_count: number;
+    }> }>(`/accounts/conversations?user_id=${encodeURIComponent(user_id)}`);
 
-    const data = await response.json();
     const backendConversations = data.conversations ?? [];
 
     // Map backend conversations to frontend format
