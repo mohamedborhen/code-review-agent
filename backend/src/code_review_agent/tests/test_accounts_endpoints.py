@@ -11,8 +11,34 @@ Full integration tests with TestClient require mocking the lifespan.
 """
 
 import unittest
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlmodel import Session, SQLModel, select
 
 from infrastructure.api.routes.accounts import router
+from infrastructure.db.engine import engine, init_db
+from infrastructure.db.models import (
+    AgentExecution,
+    Conversation,
+    Message,
+    ReviewSession,
+    ReviewToolCall,
+)
+
+
+@asynccontextmanager
+async def _test_lifespan(app: FastAPI):
+    """Minimal lifespan that only initialises the DB — no CRG/MCP."""
+    init_db()
+    yield
+
+
+_test_app = FastAPI(lifespan=_test_lifespan)
+_test_app.include_router(router, prefix="/api/v1")
+_client = TestClient(_test_app)
 
 
 class TestAccountsRouteRegistration(unittest.TestCase):
@@ -159,25 +185,79 @@ class TestConversationMessagesRoute(unittest.TestCase):
         self.assertIsNotNone(q4)
 
     def test_messages_response_shape(self):
-        """Verify the response has the expected keys."""
-        # The endpoint returns: { conversation_id, messages: [...] }
-        # Each message has: role, content, and optionally result, timestamp, etc.
+        """Verify the response has the expected keys by calling the real endpoint."""
+        msg_time = datetime(2026, 8, 30, 9, 0, 0, tzinfo=timezone.utc)
+        rs_time = datetime(2026, 8, 30, 9, 1, 0, tzinfo=timezone.utc)
+        with Session(engine) as session:
+            conv = Conversation(
+                repo_id="test-repo", user_id="test-user", created_at=msg_time, updated_at=msg_time
+            )
+            session.add(conv)
+            session.commit()
+            session.refresh(conv)
+            conv_id = conv.id
+
+            msg = Message(
+                conversation_id=conv_id, role="user", content="review this",
+                order_index=1, event_type="final", created_at=msg_time,
+            )
+            session.add(msg)
+            session.commit()
+
+            rs = ReviewSession(
+                repo_id="test-repo", graph_commit_hash="abc123",
+                request_type="review", status="completed",
+                user_id="test-user", conversation_id=conv_id,
+                created_at=rs_time, completed_at=rs_time,
+            )
+            session.add(rs)
+            session.commit()
+            session.refresh(rs)
+            rs_id = rs.id
+
+            agg = AgentExecution(
+                review_session_id=rs_id, agent_name="aggregator",
+                duration_ms=100, result="{}", created_at=rs_time,
+            )
+            session.add(agg)
+            session.commit()
+
+        resp = _client.get(f"/api/v1/accounts/conversations/{conv_id}/messages?user_id=test-user")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("conversation_id", data)
+        self.assertIn("messages", data)
+        self.assertGreater(len(data["messages"]), 0)
+
+        user_msgs = [m for m in data["messages"] if m["role"] == "user"]
+        assistant_msgs = [m for m in data["messages"] if m["role"] == "assistant"]
+        self.assertGreater(len(user_msgs), 0)
+        self.assertGreater(len(assistant_msgs), 0)
+
         expected_user_keys = {"role", "content", "order_index", "created_at"}
         expected_assistant_keys = {
             "role", "content", "result", "timestamp",
             "review_session_id", "request_type", "tool_calls",
         }
-        self.assertTrue(expected_user_keys.issubset(expected_user_keys))
-        self.assertTrue(expected_assistant_keys.issubset(expected_assistant_keys))
+        self.assertTrue(expected_user_keys.issubset(set(user_msgs[0].keys())))
+        self.assertTrue(expected_assistant_keys.issubset(set(assistant_msgs[0].keys())))
 
     def test_messages_empty_conversation(self):
         """Empty conversation returns empty messages list."""
-        # Logic: no user messages → messages = []
-        user_messages = []
-        messages = []
-        for msg in user_messages:
-            messages.append({"role": "user", "content": msg})
-        self.assertEqual(messages, [])
+        now = datetime.now(timezone.utc)
+        with Session(engine) as session:
+            conv = Conversation(
+                repo_id="test-repo", user_id="test-user", created_at=now, updated_at=now
+            )
+            session.add(conv)
+            session.commit()
+            session.refresh(conv)
+            conv_id = conv.id
+
+        resp = _client.get(f"/api/v1/accounts/conversations/{conv_id}/messages?user_id=test-user")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["messages"], [])
 
     def test_messages_pairing_logic(self):
         """Verify the pairing algorithm: session paired to most recent preceding user message."""

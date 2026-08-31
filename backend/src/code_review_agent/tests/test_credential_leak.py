@@ -118,7 +118,7 @@ def test_no_oauth_literal_outside_vendor():
     # This test documents the contract — actual enforcement is via CI grep
     # For now, assert no hits in the credential path
     # (OAuth mentions in PHASE docs are allowed — this is backend only)
-    assert not any("oauth" in h.lower() and "test_credential" not in h for h in hits) or True
+    assert not any("oauth" in h.lower() and "test_credential" not in h for h in hits)
 
 
 def test_only_basic_leaves_process():
@@ -126,4 +126,4 @@ def test_only_basic_leaves_process():
     source = (Path(__file__).parent.parent / "infrastructure/mcp_clients/mcp_client_factory.py").read_text()
     # Should contain Basic builder for Jira per-user, not raw token log
     # This is a smoke check that the file mentions Basic handling
-    assert "github_pat_override" in source or "Basic" in source or True
+    assert "github_pat_override" in source or "Basic" in source
