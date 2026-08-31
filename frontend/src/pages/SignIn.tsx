@@ -9,8 +9,7 @@ import {
   type Identity,
   type AccountLookupResult,
 } from "../state/identity";
-import { syncConversationsFromBackend } from "../state/conversationCache";
-import { syncReposFromBackend } from "../api/repos";
+
 
 interface SignInProps {
   onIdentityCreated: (identity: Identity) => void;
@@ -100,12 +99,6 @@ export default function SignIn({ onIdentityCreated }: SignInProps) {
       );
 
       if (identity) {
-        // Sync conversations and repos from backend in parallel
-        await Promise.all([
-          syncConversationsFromBackend(lookupResult.user_id),
-          syncReposFromBackend(lookupResult.user_id),
-        ]);
-
         onIdentityCreated(identity);
         navigate("/", { replace: true });
       } else {

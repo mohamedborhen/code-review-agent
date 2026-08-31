@@ -1,11 +1,13 @@
+import React from "react";
 import { getRegisteredRepos, removeRegisteredRepo } from "../../api/repos";
 
 interface ConnectedReposProps {
   onAddRepo?: () => void;
   refreshKey?: number;
+  setRefreshKey?: React.Dispatch<React.SetStateAction<number>>;
 }
 
-export default function ConnectedRepos({ onAddRepo, refreshKey }: ConnectedReposProps) {
+export default function ConnectedRepos({ onAddRepo, refreshKey, setRefreshKey }: ConnectedReposProps) {
   const repos = getRegisteredRepos();
 
   return (
@@ -57,7 +59,7 @@ export default function ConnectedRepos({ onAddRepo, refreshKey }: ConnectedRepos
             <button
               onClick={() => {
                 removeRegisteredRepo(repo.repo_id);
-                // Force re-render via refreshKey change — parent handles
+                setRefreshKey?.((k) => k + 1);
               }}
               className="text-on-surface-variant hover:text-error font-label-caps text-label-caps transition-colors flex items-center gap-1 opacity-0 group-hover/item:opacity-100"
             >

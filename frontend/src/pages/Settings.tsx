@@ -72,6 +72,7 @@ export default function Settings() {
                 <ConnectedRepos
                   onAddRepo={() => navigate("/onboarding")}
                   refreshKey={refreshKey}
+                  setRefreshKey={setRefreshKey}
                 />
               )}
             </div>
