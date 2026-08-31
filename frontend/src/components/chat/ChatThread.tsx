@@ -123,9 +123,11 @@ export default function ChatThread({ messages, toolCalls = [], isWorking = false
               </div>
             ) : (
               <div className="space-y-4">
-                <div className="bg-surface-container-low p-4 rounded-lg border border-outline-variant">
-                  <p className="font-body-md text-on-surface whitespace-pre-wrap break-words">{msg.content}</p>
-                </div>
+                {msg.content.trim() && (
+                  <div className="bg-surface-container-low p-4 rounded-lg border border-outline-variant">
+                    <p className="font-body-md text-on-surface whitespace-pre-wrap break-words">{msg.content}</p>
+                  </div>
+                )}
                 {msg.result && <FindingsList findings={msg.result.findings} parseStatus={msg.result.parse_status} />}
               </div>
             )}

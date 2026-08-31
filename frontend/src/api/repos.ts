@@ -1,7 +1,9 @@
 import { apiFetch } from "./client";
+import { loadIdentity } from "../state/identity";
 import type { BranchesResponse, RepoRegistrationRequest, RepoRegistrationResponse } from "../types/api";
 
 // Local registration cache — IndexedDB or in-memory fallback.
+// Identity-scoped: each user_id has its own repo list.
 // Mirrors successful POST /api/v1/repos calls.
 // No GET /api/v1/repos exists (§3) — both lists render from this cache.
 export interface RegisteredRepo {
@@ -12,11 +14,14 @@ export interface RegisteredRepo {
   webhook_configured: boolean;
 }
 
-const STORAGE_KEY = "reviewmind_repos_v1";
+function getStorageKey(): string {
+  const identity = loadIdentity();
+  return `reviewmind_repos_v1_${identity?.user_id ?? "anonymous"}`;
+}
 
 function loadRepos(): RegisteredRepo[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(getStorageKey());
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
@@ -24,7 +29,7 @@ function loadRepos(): RegisteredRepo[] {
 }
 
 function saveRepos(repos: RegisteredRepo[]): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(repos));
+  localStorage.setItem(getStorageKey(), JSON.stringify(repos));
 }
 
 export function getRegisteredRepos(): RegisteredRepo[] {
@@ -76,10 +81,24 @@ export async function syncReposFromBackend(user_id: string): Promise<RegisteredR
       })
     );
 
-    // Save to localStorage (will be used by the hook)
-    saveRepos(repos);
+    const existing = loadRepos();
 
-    return repos;
+    if (repos.length === 0) {
+      return existing;
+    }
+
+    const merged = [...existing];
+    for (const repo of repos) {
+      const idx = merged.findIndex((r) => r.repo_id === repo.repo_id);
+      if (idx >= 0) {
+        merged[idx] = repo;
+      } else {
+        merged.push(repo);
+      }
+    }
+
+    saveRepos(merged);
+    return merged;
   } catch (error) {
     console.error("Failed to sync repos from backend:", error);
     return [];

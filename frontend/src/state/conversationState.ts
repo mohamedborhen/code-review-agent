@@ -1,9 +1,18 @@
 // Conversation state persistence — stores messages and active conversation ID in localStorage.
+// Identity-scoped: each user_id has its own active conversation and message store.
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { ChatMessage } from "../components/chat/ChatThread";
+import { loadIdentity } from "./identity";
 
-const ACTIVE_CONV_KEY = "reviewmind_active_conversation_v1";
-const MESSAGES_KEY_PREFIX = "reviewmind_messages_v1_";
+function getActiveConvKey(): string {
+  const identity = loadIdentity();
+  return `reviewmind_active_conversation_v1_${identity?.user_id ?? "anonymous"}`;
+}
+
+function getMessagesKeyPrefix(): string {
+  const identity = loadIdentity();
+  return `reviewmind_messages_v1_${identity?.user_id ?? "anonymous"}_`;
+}
 
 export interface ConversationState {
   activeConversationId: number | null;
@@ -12,7 +21,7 @@ export interface ConversationState {
 
 function loadActiveConversationId(): number | null {
   try {
-    const raw = localStorage.getItem(ACTIVE_CONV_KEY);
+    const raw = localStorage.getItem(getActiveConvKey());
     if (!raw) return null;
     const id = parseInt(raw, 10);
     return isNaN(id) ? null : id;
@@ -24,9 +33,9 @@ function loadActiveConversationId(): number | null {
 function saveActiveConversationId(id: number | null): void {
   try {
     if (id === null) {
-      localStorage.removeItem(ACTIVE_CONV_KEY);
+      localStorage.removeItem(getActiveConvKey());
     } else {
-      localStorage.setItem(ACTIVE_CONV_KEY, String(id));
+      localStorage.setItem(getActiveConvKey(), String(id));
     }
   } catch {
     // ignore
@@ -35,16 +44,16 @@ function saveActiveConversationId(id: number | null): void {
 
 function loadMessages(conversationId: number): ChatMessage[] {
   try {
-    const raw = localStorage.getItem(MESSAGES_KEY_PREFIX + conversationId);
+    const raw = localStorage.getItem(getMessagesKeyPrefix() + conversationId);
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
   }
 }
 
-function saveMessages(conversationId: number, messages: ChatMessage[]): void {
+export function saveMessages(conversationId: number, messages: ChatMessage[]): void {
   try {
-    localStorage.setItem(MESSAGES_KEY_PREFIX + conversationId, JSON.stringify(messages));
+    localStorage.setItem(getMessagesKeyPrefix() + conversationId, JSON.stringify(messages));
   } catch {
     // ignore — localStorage full or unavailable
   }

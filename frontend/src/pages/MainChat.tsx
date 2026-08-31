@@ -22,6 +22,7 @@ import { createConversation } from "../api/conversations";
 import { getLatestReview } from "../api/reviewStatus";
 import { useReviewTurn } from "../hooks/useReviewTurn";
 import { useReviewProgress } from "../hooks/useReviewProgress";
+import { formatAnswer } from "../utils/formatAnswer";
 import type { RequestType, AggregatedOutput, ReviewToolCallItem } from "../types/api";
 
 export default function MainChat() {
@@ -186,7 +187,8 @@ export default function MainChat() {
 
   const handleDeleteConversation = useCallback((conversationId: number) => {
     removeConversation(conversationId);
-    localStorage.removeItem("reviewmind_messages_v1_" + conversationId);
+    const userId = identity?.user_id ?? "anonymous";
+    localStorage.removeItem(`reviewmind_messages_v1_${userId}_${conversationId}`);
     clearReviewState(conversationId);
     if (activeConversationId === conversationId) {
       setActiveConversationId(null);
@@ -364,18 +366,4 @@ export default function MainChat() {
       </div>
     </div>
   );
-}
-
-function formatAnswer(result: AggregatedOutput): string {
-  const parts: string[] = [];
-
-  if (result.parse_status !== "ok") {
-    parts.push(`Parse status: ${result.parse_status}`);
-  }
-
-  if (result.findings.length === 0) {
-    parts.push("No findings to report.");
-  }
-
-  return parts.join("\n");
 }

@@ -4,6 +4,8 @@
 // Sent wherever backend requires user_id (POST /repos, conversations, review).
 // Supports local identity switching (NOT authentication).
 
+import type { AggregatedOutput } from "../types/api";
+
 const KEY = "reviewmind_identity_v1";
 const ACCOUNTS_KEY = "reviewmind_accounts_v1";
 
@@ -57,6 +59,46 @@ export function clearIdentity(): void {
   localStorage.removeItem(KEY);
 }
 
+export function resetActiveUserState(): void {
+  const identity = loadIdentity();
+  if (!identity) return;
+  localStorage.removeItem(`reviewmind_active_conversation_v1_${identity.user_id}`);
+  localStorage.removeItem(`reviewmind_active_repo_v1_${identity.user_id}`);
+}
+
+const LEGACY_PURGE_KEY = "reviewmind_legacy_purged_v1";
+
+/**
+ * Remove old unscoped localStorage keys from before identity-scoping was added.
+ * Runs once per browser (sentinel key prevents re-running).
+ */
+export function purgeLegacyKeys(): void {
+  if (localStorage.getItem(LEGACY_PURGE_KEY)) return;
+
+  const legacyPatterns = [
+    /^reviewmind_messages_v1_\d+$/,           // reviewmind_messages_v1_42
+    /^reviewmind_tool_calls_v1_\d+$/,         // reviewmind_tool_calls_v1_42
+    /^reviewmind_review_session_v1_\d+$/,     // reviewmind_review_session_v1_42
+    /^reviewmind_pending_turn_v1_\d+$/,       // reviewmind_pending_turn_v1_42
+    /^reviewmind_active_conversation_v1$/,    // old unscoped active conversation
+    /^reviewmind_active_repo_v1$/,            // old unscoped active repo
+  ];
+
+  const keysToRemove: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && legacyPatterns.some((p) => p.test(key))) {
+      keysToRemove.push(key);
+    }
+  }
+
+  for (const key of keysToRemove) {
+    localStorage.removeItem(key);
+  }
+
+  localStorage.setItem(LEGACY_PURGE_KEY, "true");
+}
+
 // --- Account switching (local, NOT authentication) ---
 
 interface AccountEntry {
@@ -103,6 +145,7 @@ export function switchToAccountById(user_id: string): Identity | null {
   const accounts = loadAllAccounts();
   const account = accounts.find((a) => a.user_id === user_id);
   if (!account) return null;
+  resetActiveUserState();
   account.last_used = new Date().toISOString();
   saveAccounts(accounts);
   const identity: Identity = {
@@ -163,6 +206,43 @@ export interface BackendReview {
   completed_at: string | null;
   duration_ms: number | null;
   finding_count: number;
+}
+
+export interface BackendToolCall {
+  agent_name: string;
+  tool_name: string;
+  tool_input: string | null;
+  tool_output: string | null;
+  tool_latency_ms: number | null;
+  tool_status: "success" | "error" | null;
+  created_at: string | null;
+}
+
+export interface BackendFinding {
+  severity: string;
+  confidence: number;
+  title: string;
+  description: string;
+  evidence: string[];
+  recommendation: string;
+}
+
+export interface BackendAggregatedResult {
+  agent_name: string;
+  findings: BackendFinding[];
+  parse_status: string;
+}
+
+export interface BackendMessage {
+  role: "user" | "assistant";
+  content: string;
+  order_index?: number;
+  created_at?: string | null;
+  result?: BackendAggregatedResult | null;
+  timestamp?: string | null;
+  review_session_id?: number | null;
+  request_type?: string | null;
+  tool_calls?: BackendToolCall[];
 }
 
 /**
@@ -237,8 +317,30 @@ export async function fetchBackendReviews(user_id: string): Promise<BackendRevie
 }
 
 /**
+ * Fetch interleaved user messages and assistant results for a conversation.
+ */
+export async function fetchBackendMessages(
+  user_id: string,
+  conversation_id: number,
+): Promise<BackendMessage[]> {
+  try {
+    const response = await fetch(
+      `/api/v1/accounts/conversations/${conversation_id}/messages?user_id=${encodeURIComponent(user_id)}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch messages: ${response.statusText}`);
+    }
+    const data = await response.json();
+    return data.messages ?? [];
+  } catch (error) {
+    console.error("Failed to fetch backend messages:", error);
+    return [];
+  }
+}
+
+/**
  * Import an account from the backend.
- * Sets the active identity and syncs conversations/repos to localStorage.
+ * Sets the active identity and syncs conversations/repos/messages to localStorage.
  * Returns the imported Identity, or null on failure.
  */
 export async function importAccountFromBackend(
@@ -259,10 +361,52 @@ export async function importAccountFromBackend(
   };
 
   // 3. Save as active identity
+  resetActiveUserState();
   localStorage.setItem(KEY, JSON.stringify(identity));
 
   // 4. Add to accounts list
   addAccountToStorage(identity);
+
+  // 5. Sync conversations from backend
+  const { syncConversationsFromBackend } = await import("./conversationCache");
+  const conversations = await syncConversationsFromBackend(user_id);
+
+  // 6. Sync repos from backend
+  const { syncReposFromBackend } = await import("../api/repos");
+  await syncReposFromBackend(user_id);
+
+  // 7. Sync messages for each conversation
+  const { saveMessages } = await import("./conversationState");
+
+  for (const conv of conversations) {
+    const backendMessages = await fetchBackendMessages(user_id, conv.conversation_id);
+    if (backendMessages.length === 0) continue;
+
+    const { formatAnswer } = await import("../utils/formatAnswer");
+    const chatMessages = backendMessages.map((bm, idx) => {
+      if (bm.role === "user") {
+        return {
+          id: `restored-user-${conv.conversation_id}-${idx}`,
+          role: "user" as const,
+          content: bm.content,
+          timestamp: bm.created_at ?? new Date().toISOString(),
+        };
+      }
+      // Assistant message
+      const result = bm.result
+        ? { ...bm.result, parse_status: bm.result.parse_status as AggregatedOutput["parse_status"] }
+        : undefined;
+      return {
+        id: `restored-assistant-${conv.conversation_id}-${bm.review_session_id ?? idx}`,
+        role: "assistant" as const,
+        content: result ? formatAnswer(result as AggregatedOutput) : bm.content,
+        result: result as AggregatedOutput | undefined,
+        timestamp: bm.timestamp ?? new Date().toISOString(),
+      };
+    });
+
+    saveMessages(conv.conversation_id, chatMessages);
+  }
 
   return identity;
 }

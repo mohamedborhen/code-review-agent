@@ -3,6 +3,8 @@ import {
   loadIdentity,
   switchToAccountById,
   createNewAccount,
+  lookupAccount,
+  importAccountFromBackend,
   type Identity,
 } from "../../state/identity";
 
@@ -20,15 +22,41 @@ export default function AccountCard({ onAccountSwitch }: AccountCardProps) {
   const [justCreated, setJustCreated] = useState<Identity | null>(null);
   const [copied, setCopied] = useState(false);
 
-  const handleSwitch = () => {
+  const handleSwitch = async () => {
     const id = switchId.trim();
     if (!id) return;
     setSwitchError("");
-    const switched = switchToAccountById(id);
+
+    // 1. Try localStorage first
+    let switched = switchToAccountById(id);
     if (switched) {
       onAccountSwitch?.(switched);
+      return;
+    }
+
+    // 2. Check backend
+    const lookup = await lookupAccount(id);
+    if (!lookup || !lookup.exists) {
+      setSwitchError("No account with this ID found on this device or in the backend.");
+      return;
+    }
+
+    // 3. Prompt for display name (required for restore)
+    const displayName = prompt(
+      `Account found in backend (${lookup.conversation_count} conversations, ${lookup.repo_count} repos). Enter display name to restore:`,
+      lookup.display_name || ""
+    );
+    if (!displayName?.trim()) {
+      setSwitchError("Display name is required to restore account.");
+      return;
+    }
+
+    // 4. Import from backend
+    const imported = await importAccountFromBackend(id, displayName.trim());
+    if (imported) {
+      onAccountSwitch?.(imported);
     } else {
-      setSwitchError("No account with this ID found on this device. The account must have been created here first.");
+      setSwitchError("Failed to restore account from backend.");
     }
   };
 

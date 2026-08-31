@@ -28,7 +28,7 @@ class BranchNotFoundError(Exception):
         super().__init__(f"Branch {branch!r} not found in {owner}/{repo}")
 
 
-async def list_repo_branches(mcp_client, owner: str, repo: str) -> list[dict[str, Any]]:
+async def list_repo_branches(mcp_client, owner: str, repo: str, branch: str | None = None) -> list[dict[str, Any]]:
     """Return ``[{name, sha, protected}, ...]`` for every remote branch."""
     github_tools = await mcp_client.get_tools(server_name="github")
     list_branches_tool = scoped(github_tools, {"list_branches"})[0]
@@ -42,19 +42,19 @@ async def list_repo_branches(mcp_client, owner: str, repo: str) -> list[dict[str
         # Non-JSON output (e.g. an MCP tool error/rate-limit payload) must not
         # surface as an uncaught parse error -> 500. Treat it as a clean
         # not-found so the caller can respond 404 instead.
-        raise BranchNotFoundError(owner, repo, "<all>") from None
+        raise BranchNotFoundError(owner, repo, branch or "<all>") from None
     if isinstance(payload, dict) and isinstance(payload.get("branches"), list):
         return payload["branches"]
     if isinstance(payload, list):
         return payload
-    raise BranchNotFoundError(owner, repo, "<all>")
+    raise BranchNotFoundError(owner, repo, branch or "<all>")
 
 
 async def resolve_branch_to_commit(
     mcp_client, owner: str, repo: str, branch: str
 ) -> str:
     """Resolve ``branch`` to its current commit SHA via ``list_branches``."""
-    branches = await list_repo_branches(mcp_client, owner, repo)
+    branches = await list_repo_branches(mcp_client, owner, repo, branch)
     for entry in branches:
         if entry.get("name") == branch:
             sha = entry.get("sha")
