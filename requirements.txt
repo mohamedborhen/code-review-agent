@@ -18,3 +18,8 @@ langchain-openai>=0.0.1
 langchain-groq>=0.0.1
 langchain-openrouter>=0.0.1
 langchain-nvidia-ai-endpoints>=1.4.3,<2
+aiosqlite
+pytest
+cryptography
+python-dotenv
+httpx
