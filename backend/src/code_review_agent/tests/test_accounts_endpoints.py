@@ -142,8 +142,6 @@ class TestConversationMessagesRoute(unittest.TestCase):
 
     def test_messages_query_structure(self):
         """Verify the core query structure for pairing messages to sessions."""
-        from sqlmodel import select
-        from infrastructure.db.models import Message, ReviewSession, AgentExecution, ReviewToolCall
 
         # User messages query
         q1 = (
