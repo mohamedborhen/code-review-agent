@@ -100,6 +100,18 @@ Each agent receives scoped MCP tools (CRG graph, GitHub, Atlassian, Context7) pl
 | mcp-atlassian | 9000 | Jira issues + Confluence pages (read-only) |
 | Conversation MCP | 9001 | FTS5 full-text search across conversation history |
 
+### Code Review Graph (CRG)
+
+CRG is a Tree-sitter-based tool that builds a **structural knowledge graph** of each registered repository, stored in SQLite and queried via MCP. The graph captures functions, classes, and files as nodes, with edges representing call relationships, imports, inheritance, and test coverage. It also computes community clusters, centrality metrics (hub/bridge nodes), and execution flows — giving review agents structural context beyond what raw file contents provide.
+
+**Initial build:** When a repo is registered (`POST /repos`), a shallow clone is created and CRG runs `build_or_update_graph_tool(full_rebuild=True)` to analyze the entire codebase. The resulting graph is tied to a specific commit SHA and recorded as a `GraphSnapshot` with status `"ready"` or `"error"`.
+
+**Incremental updates:** When a push webhook arrives on the default branch, CRG runs `build_or_update_graph_tool(full_rebuild=False, base=<last_indexed_commit>)`. It internally executes `git diff base..HEAD` to find changed files and incrementally updates only those parts of the graph — no full rebuild needed. This requires a `.git` history (shallow clones with `--depth 1` are sufficient since the diff base is tracked).
+
+**Branch handling:** Each branch gets its own git worktree (a sibling directory of the base clone, e.g. `data/workspaces/my-repo__feature-x`). When a review is requested for a branch that hasn't been seen before, `EnsureBranchWorktreeService` creates the worktree and runs a full graph build. Subsequent reviews on the same branch trigger incremental updates. If a force-push makes the diff base unreachable, CRG falls back to a full rebuild automatically.
+
+**Readiness gate:** Before any review runs, `GraphReadinessService` checks that a `GraphSnapshot` with `status="ready"` exists for the target commit. If not, the API returns HTTP 425 ("Graph not ready") and optionally triggers a background build. This is the "Preparing this branch..." state shown in the frontend.
+
 ---
 
 ## Getting Started
