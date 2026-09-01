@@ -58,3 +58,8 @@ app.include_router(review_router, prefix="/api/v1")
 app.include_router(conversation_router, prefix="/api/v1")
 app.include_router(integrations_router, prefix="/api/v1")
 app.include_router(accounts_router, prefix="/api/v1")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}

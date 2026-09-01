@@ -4,7 +4,7 @@ data
 logs
 __pycache__
 *.pyc
-.env
+**/.env
 .gitignore
 README.md
 AGENTS.md
@@ -12,3 +12,13 @@ PHASE_*.md
 OPENCODE.md
 check_repo.py
 inspect_db.py
+frontend/
+.agents/
+.opencode/
+.superpowers/
+.code-review-graph/
+*.db
+*.sqlite
+.pytest_cache/
+docs/
+backend/src/code_review_agent/data/
