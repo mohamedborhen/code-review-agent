@@ -44,3 +44,16 @@ phases3+4_backup.json
 # Python cache
 .pytest_cache/
 __pypackages__/
+
+# Internal dev docs (consumed, no longer needed in repo)
+AGENTS.md
+OPENCODE.md
+PHASE_*.md
+*_SUMMARY.md
+*_TEST_PLAN.md
+*_TEST_REPORT.md
+Branch-Aware Graph Management.md
+
+# Opencode skill lock files
+skills-lock.json
+backend/**/skills-lock.json
