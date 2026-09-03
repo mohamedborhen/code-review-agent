@@ -331,7 +331,7 @@ The frontend is a React 18 single-page application built with Vite, styled with 
 
 ### PWA
 
-- **Offline fallback:** Navigating to an un-cached route shows `offline.html` with a retry button
+- **Offline fallback:** When offline, the SW serves the cached `index.html` (app loads with degraded API). `offline.html` is available as a static fallback asset.
 - **Install:** Available via browser install prompt (Settings page shows install button)
 - **Icons:** 192x192 and 512x512 PNG icons in `frontend/public/icons/`
 
