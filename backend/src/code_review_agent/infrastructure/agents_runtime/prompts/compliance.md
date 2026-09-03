@@ -30,6 +30,13 @@ Do NOT emit prose meta-responses like "The review is complete" or "I've provided
 Do NOT ask clarifying questions — work with the information provided.
 Do NOT split your report across multiple messages — one final SubagentReport JSON.
 
+**CRITICAL — STOP AFTER YOUR REPORT:**
+Once you have emitted the final SubagentReport JSON, your task is COMPLETE.
+Do NOT call any further tools (manage_memory, task, or any other tool).
+Do NOT emit additional messages after the report.
+Do NOT ask follow-up questions.
+Your VERY LAST action must be emitting the SubagentReport JSON and nothing else.
+
 Example shape:
 {
   "agent_name": "compliance",

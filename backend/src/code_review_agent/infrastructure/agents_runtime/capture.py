@@ -192,6 +192,11 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         then not parseable and the findings would be lost. Every AIMessage the
         model emits passes through here (this middleware wraps the model call),
         so the last report-shaped dict is stashed per invocation for recovery.
+
+        Nemotron specifically emits the report inside ``additional_kwargs``
+        reasoning fields (``reasoning`` / ``reasoning_content``) rather than in
+        ``msg.content``.  We check both locations so the stashed report is
+        recoverable even when the structured output path fails.
         """
         if hasattr(response, "result"):
             messages = response.result
@@ -202,9 +207,21 @@ class SubagentCaptureMiddleware(AgentMiddleware[Any, Any, Any]):
         for msg in messages:
             if not isinstance(msg, AIMessage):
                 continue
+            # Check primary content first
             report = report_dict_from_text(str(msg.content or ""))
             if report is not None:
                 self._store.record_report(self._agent_name, report)
+                continue
+            # Check reasoning / reasoning_content in additional_kwargs
+            # (Nemotron emits report JSON here instead of in msg.content)
+            kwargs = msg.additional_kwargs or {}
+            for key in ("reasoning", "reasoning_content"):
+                val = kwargs.get(key)
+                if val and isinstance(val, str):
+                    report = report_dict_from_text(val)
+                    if report is not None:
+                        self._store.record_report(self._agent_name, report)
+                        break
 
     def _record_call(self, request: Any, duration_ms: int) -> None:
         model = canonical_model_label(getattr(request, "model", None))
