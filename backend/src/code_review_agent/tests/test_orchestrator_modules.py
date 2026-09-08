@@ -176,6 +176,16 @@ class TestBuildUserMessage:
         )
         assert "Check X" in msg
 
+    def test_question_included_for_explain_question(self):
+        from infrastructure.agents_runtime.orchestrator_message import _build_user_message
+
+        msg = _build_user_message(
+            self._make_input(request_type="explain_question", question="What does auth.py do?"),
+            [],
+        )
+        assert "What does auth.py do?" in msg
+        assert "Question from the user:" in msg
+
     def test_conversation_block_appended_when_context_available(self):
         from infrastructure.agents_runtime.orchestrator_message import _build_user_message
 
