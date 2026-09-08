@@ -490,31 +490,6 @@ def _parse_aggregated(result: dict) -> AgentOutput:
                 parse_status="fallback_from_specialists",
             )
 
-    # Path 6: No subagents case (explain_question) — try to extract report from raw AIMessage content
-    # using the comprehensive repair function that handles prose-wrapped JSON
-    if messages:
-        for msg in reversed(messages):
-            if not isinstance(msg, AIMessage) or not msg.content:
-                continue
-            raw_text = _extract_text_from_content(msg.content)
-            # Debug: log raw model output for explain_question debugging
-            logger.info("RAW MODEL OUTPUT (aggregator AIMessage): %s", raw_text[:2000])
-            logger.debug("Attempting _repair_stringified_report on aggregator AIMessage, length=%d", len(raw_text))
-            repaired = _repair_stringified_report(raw_text)
-            if repaired:
-                try:
-                    report = SubagentReport.model_validate_json(repaired)
-                    logger.info("Successfully parsed aggregator via _repair_stringified_report on AIMessage")
-                    return AgentOutput(agent_name="aggregator", findings=_to_agent_output(report).findings)
-                except Exception:
-                    pass
-                try:
-                    report = _coerce_report(repaired, "aggregator")
-                    logger.info("Successfully parsed aggregator via _repair_stringified_report + _coerce_report on AIMessage")
-                    return AgentOutput(agent_name="aggregator", findings=_to_agent_output(report).findings)
-                except Exception:
-                    pass
-
     logger.warning("No structured_response in orchestrator result; returning empty aggregated output")
     return AgentOutput(
         agent_name="aggregator",

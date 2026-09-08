@@ -11,9 +11,8 @@ from domain.entities.agent_finding import AgentInput
 # `question` field so the user can steer the specialist (e.g. a ticket key to
 # check). `review` (full pipeline) forwards it too so users can give the
 # orchestrator both the diff and a linked Jira ticket key in one prompt.
-# `explain_question` forwards it so the orchestrator knows what to explain.
 _QUESTION_CARRYING_TYPES = frozenset(
-    {"review", "compliance_question", "security_question", "performance_question", "impact_question", "explain_question"}
+    {"review", "compliance_question", "security_question", "performance_question", "impact_question"}
 )
 
 

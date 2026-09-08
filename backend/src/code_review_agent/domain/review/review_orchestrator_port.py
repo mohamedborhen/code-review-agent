@@ -16,7 +16,7 @@ class ReviewOrchestratorPort(Protocol):
         Args:
             review_input: Domain input; ``repo_root`` carries the DB-resolved local_path.
             agent_names: Routing-policy agent list for this request_type. Empty list is
-                valid (orchestrator answers directly, e.g. explain_question).
+                valid (orchestrator answers directly).
 
         Returns:
             A ReviewResult: ``aggregated`` is the aggregator's synthesized AgentOutput

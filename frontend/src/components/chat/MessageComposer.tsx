@@ -8,7 +8,6 @@ const REQUEST_TYPES: { label: string; value: RequestType }[] = [
   { label: "Compliance Check", value: "compliance_question" },
   { label: "Performance", value: "performance_question" },
   { label: "Impact Analysis", value: "impact_question" },
-  { label: "Explain Code", value: "explain_question" },
 ];
 
 interface MessageComposerProps {

@@ -16,7 +16,6 @@ ROUTING_POLICY: Final[dict[str, list[str]]] = {
     "compliance_question": ["compliance"],
     "performance_question": ["performance"],
     "impact_question": ["regression"],
-    "explain_question": [],
     "any_question": ["compliance", "security", "performance", "regression"],
 }
 

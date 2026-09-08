@@ -4,7 +4,7 @@
 
 export type RequestType =
   | "review" | "security_question" | "compliance_question"
-  | "performance_question" | "impact_question" | "explain_question"
+  | "performance_question" | "impact_question"
   | "any_question";
 
 export interface Branch { name: string; sha: string; protected: boolean; }
